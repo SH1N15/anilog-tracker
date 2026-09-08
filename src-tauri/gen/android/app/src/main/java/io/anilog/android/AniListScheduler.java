@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.LocalTime;
 import java.time.ZoneOffset;
+import java.util.ArrayDeque;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -25,6 +26,10 @@ final class AniListScheduler {
     private static final long BANGUMI_EPISODES_CACHE_TTL_SECONDS = 24L * 60L * 60L;
     // 分钟级值只来自成功的 AniList 响应；上游短暂故障时最多保留一周。
     private static final long ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS = 7L * 24L * 60L * 60L;
+    // AniList 公开限额通常是 90 次/分钟，但负载保护时会收紧到 30。桌面与
+    // Android 都保守使用 30，避免后台补偿和手动同步叠加成短时间突发。
+    private static final int ANILIST_SAFE_REQUESTS_PER_MINUTE = 30;
+    private static final ArrayDeque<Long> ANILIST_REQUEST_WINDOW = new ArrayDeque<>();
 
     private AniListScheduler() {}
 
@@ -77,25 +82,20 @@ final class AniListScheduler {
                     // 只缓存原始成功响应；缓存结构不进入 WebDAV，也不记录 token。
                     MobileStore.setAnilistScheduleCache(appContext, item, System.currentTimeMillis() / 1000L);
                 }
-                JSONObject followed = MobileStore.findFollowByAnilistId(appContext, animeId);
-                if (!BuildConfig.isOriginalEdition && followed != null && "bangumi".equals(followed.optString("source"))) {
-                    // Bangumi 逐集表确认作品/集号，AniList 为同一集提供最终
-                    // airingAt。不能再要求日期完全相同：延期、停播和改档正是
-                    // Bangumi 日期级数据最容易落后的地方。集号不一致时仍拒绝
-                    // 覆盖，避免分季或错误映射串番。
-                    int expectedEpisode = followed.optInt("nextEpisode", 0);
-                    if (next == null || expectedEpisode <= 0 || next.optInt("episode", 0) != expectedEpisode
-                        || next.optLong("airingAt", 0) <= 0) {
-                        MobileStore.updateCover(appContext, followed.optInt("id"), coverImage);
-                        continue;
+                if (!BuildConfig.isOriginalEdition) {
+                    // 一个 AniList media 可能被多个 Bangumi 分季 subject 共用。
+                    // 逐条处理，让每个 subject 以自己的 Bangumi `ep` 保持身份；
+                    // AniList 的全集序号只通过 Bangumi `sort` 映射为本地集号。
+                    boolean hasBangumiMatch = false;
+                    JSONArray currentFollowing = MobileStore.following(appContext);
+                    for (int followIndex = 0; followIndex < currentFollowing.length(); followIndex += 1) {
+                        JSONObject followed = currentFollowing.optJSONObject(followIndex);
+                        if (followed == null || !"bangumi".equals(followed.optString("source"))
+                            || followed.optInt("anilistId", 0) != animeId) continue;
+                        hasBangumiMatch = true;
+                        updated += applyAniListPrecisionToBangumiFollow(appContext, followed, next, coverImage);
                     }
-                    MobileStore.updateSchedule(appContext, followed.optInt("id"), expectedEpisode, next.optLong("airingAt"), coverImage);
-                    // Bangumi 日期错误时可能已经提前生成 pending 任务；AniList
-                    // 的时间是最终门禁，未来集必须撤回，待实际播出后再创建。
-                    removeFuturePendingTask(appContext, followed.optInt("id"), followed.optInt("anilistId", 0), expectedEpisode,
-                        next.optLong("airingAt"));
-                    updated += 1;
-                    continue;
+                    if (hasBangumiMatch) continue;
                 }
                 if (next == null) {
                     MobileStore.updateSchedule(appContext, animeId, null, null, coverImage);
@@ -186,9 +186,8 @@ final class AniListScheduler {
             for (int i = 0; i < episodes.length(); i += 1) {
                 JSONObject episode = episodes.optJSONObject(i);
                 if (episode == null || episode.optInt("type", 0) != 0) continue;
-                double sort = episode.optDouble("sort", 0);
-                int number = (int) Math.rint(sort);
-                if (number <= 0 || Math.abs(sort - number) >= 0.25) continue;
+                int number = episodeNumber(episode);
+                if (number <= 0) continue;
                 String airdate = episode.optString("airdate", "").trim();
                 if (airdate.isEmpty()) continue;
                 boolean aired = isAired(airdate, now);
@@ -232,14 +231,9 @@ final class AniListScheduler {
                 context, anilistId, now, ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS);
             if (media == null) continue;
             JSONObject next = media.optJSONObject("nextAiringEpisode");
-            if (next == null || next.optInt("episode", 0) != expectedEpisode) continue;
-            long airingAt = next.optLong("airingAt", 0);
-            if (airingAt <= 0) continue;
             JSONObject cover = media.optJSONObject("coverImage");
             String coverImage = cover == null ? null : cover.optString("medium", null);
-            MobileStore.updateSchedule(context, subjectId, expectedEpisode, airingAt, coverImage);
-            removeFuturePendingTask(context, subjectId, anilistId, expectedEpisode, airingAt);
-            updated += 1;
+            updated += applyAniListPrecisionToBangumiFollow(context, follow, next, coverImage);
         }
         return updated;
     }
@@ -319,11 +313,22 @@ final class AniListScheduler {
         for (int index = 0; index < episodes.length(); index += 1) {
             JSONObject episode = episodes.optJSONObject(index);
             if (episode == null || episode.optInt("type", 0) != 0) continue;
-            double sort = episode.optDouble("sort", 0);
-            int rounded = (int) Math.rint(sort);
-            if (rounded == number && Math.abs(sort - rounded) < 0.25) return episode;
+            if (episodeNumber(episode) == number) return episode;
         }
         return null;
+    }
+
+    /** Bangumi `ep` is the local season number; `sort` is global order. */
+    private static int episodeNumber(JSONObject episode) {
+        double ep = episode.optDouble("ep", Double.NaN);
+        if (!Double.isNaN(ep)) {
+            int rounded = (int) Math.rint(ep);
+            if (rounded > 0 && Math.abs(ep - rounded) < 0.25) return rounded;
+        }
+        double sort = episode.optDouble("sort", Double.NaN);
+        if (Double.isNaN(sort)) return 0;
+        int rounded = (int) Math.rint(sort);
+        return rounded > 0 && Math.abs(sort - rounded) < 0.25 ? rounded : 0;
     }
 
     private static void removeFuturePendingTask(Context context, int subjectId, int anilistId, int episode, long airingAt) {
@@ -343,7 +348,97 @@ final class AniListScheduler {
         MobileStore.setTasks(context, kept);
     }
 
+    /**
+     * Apply an AniList minute timestamp only after the current Bangumi subject
+     * has confirmed which local episode it belongs to.  AniList usually uses
+     * the same number; for split subjects it may use Bangumi's global `sort`.
+     */
+    private static int applyAniListPrecisionToBangumiFollow(
+        Context context,
+        JSONObject follow,
+        JSONObject next,
+        String coverImage
+    ) {
+        int subjectId = follow.optInt("id", 0);
+        int anilistId = follow.optInt("anilistId", 0);
+        int expectedEpisode = follow.optInt("nextEpisode", 0);
+        if (subjectId <= 0 || expectedEpisode <= 0) return 0;
+        if (next == null || next.optLong("airingAt", 0) <= 0) {
+            MobileStore.updateCover(context, subjectId, coverImage);
+            return 0;
+        }
+        int aniListEpisode = next.optInt("episode", 0);
+        int localEpisode = localEpisodeForAniListNumber(context, subjectId, aniListEpisode);
+        if (localEpisode <= 0) {
+            // AniList may number a split subject from the enclosing season
+            // (e.g. ep16) while Bangumi's subject starts at local ep5.  When
+            // `sort` is not the same number space, the scheduled calendar
+            // date is the stable bridge between the two sources.
+            localEpisode = localEpisodeForAniListDate(
+                context, subjectId, next.optLong("airingAt", 0));
+        }
+        if (localEpisode != expectedEpisode) {
+            MobileStore.updateCover(context, subjectId, coverImage);
+            return 0;
+        }
+        long airingAt = next.optLong("airingAt", 0);
+        MobileStore.updateSchedule(context, subjectId, expectedEpisode, airingAt, coverImage);
+        // Bangumi 日期错误时可能已经提前生成 pending 任务；AniList 的时间
+        // 是最终门禁，未来集必须撤回，待实际播出后再创建。
+        removeFuturePendingTask(context, subjectId, anilistId, expectedEpisode, airingAt);
+        return 1;
+    }
+
+    private static int localEpisodeForAniListNumber(Context context, int subjectId, int aniListEpisode) {
+        if (aniListEpisode <= 0) return 0;
+        JSONArray episodes = MobileStore.bangumiEpisodesCache(
+            context, subjectId, System.currentTimeMillis() / 1000L, -1, false);
+        if (episodes == null) return 0;
+        for (int index = 0; index < episodes.length(); index += 1) {
+            JSONObject episode = episodes.optJSONObject(index);
+            if (episode == null || episode.optInt("type", 0) != 0) continue;
+            int local = episodeNumber(episode);
+            if (local <= 0) continue;
+            if (local == aniListEpisode || episodeSortNumber(episode) == aniListEpisode) return local;
+        }
+        return 0;
+    }
+
+    private static int episodeSortNumber(JSONObject episode) {
+        double sort = episode.optDouble("sort", Double.NaN);
+        if (Double.isNaN(sort)) return 0;
+        int rounded = (int) Math.rint(sort);
+        return rounded > 0 && Math.abs(sort - rounded) < 0.25 ? rounded : 0;
+    }
+
+    private static int localEpisodeForAniListDate(Context context, int subjectId, long airingAt) {
+        if (subjectId <= 0 || airingAt <= 0) return 0;
+        JSONArray episodes = MobileStore.bangumiEpisodesCache(
+            context, subjectId, System.currentTimeMillis() / 1000L, -1, false);
+        if (episodes == null) return 0;
+        LocalDate utcDate = Instant.ofEpochSecond(airingAt).atZone(ZoneOffset.UTC).toLocalDate();
+        LocalDate eastAsiaDate = Instant.ofEpochSecond(airingAt)
+            .atZone(ZoneOffset.ofHours(8)).toLocalDate();
+        for (int index = 0; index < episodes.length(); index += 1) {
+            JSONObject episode = episodes.optJSONObject(index);
+            if (episode == null || episode.optInt("type", 0) != 0) continue;
+            String airdate = episode.optString("airdate", "").trim();
+            if (airdate.length() < 10) continue;
+            LocalDate bangumiDate;
+            try {
+                bangumiDate = LocalDate.parse(airdate.substring(0, 10));
+            } catch (RuntimeException error) {
+                continue;
+            }
+            if (bangumiDate.equals(utcDate) || bangumiDate.equals(eastAsiaDate)) {
+                return episodeNumber(episode);
+            }
+        }
+        return 0;
+    }
+
     private static JSONArray request(JSONArray ids) throws IOException, JSONException {
+        awaitAniListPermit();
         JSONObject variables = new JSONObject().put("ids", ids);
         JSONObject payload = new JSONObject().put("query", QUERY).put("variables", variables);
         HttpURLConnection connection = (HttpURLConnection) new URL(ENDPOINT).openConnection();
@@ -352,7 +447,9 @@ final class AniListScheduler {
         connection.setReadTimeout(20_000);
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json");
-        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("Accept", "application/json, multipart/mixed");
+        connection.setRequestProperty("Origin", "https://anilist.co");
+        connection.setRequestProperty("Referer", "https://anilist.co/");
         connection.setRequestProperty("User-Agent", "AniLog-Android/" + BuildConfig.VERSION_NAME + " (https://github.com/SH1N15/anilog-tracker)");
         byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
         connection.setFixedLengthStreamingMode(body.length);
@@ -372,6 +469,30 @@ final class AniListScheduler {
         JSONArray media = page == null ? null : page.optJSONArray("media");
         if (media == null) throw new IOException("AniList returned invalid schedule data");
         return media;
+    }
+
+    private static void awaitAniListPermit() throws IOException {
+        while (true) {
+            long waitMillis = 0;
+            synchronized (ANILIST_REQUEST_WINDOW) {
+                long now = System.currentTimeMillis();
+                while (!ANILIST_REQUEST_WINDOW.isEmpty()
+                    && now - ANILIST_REQUEST_WINDOW.peekFirst() >= 60_000L) {
+                    ANILIST_REQUEST_WINDOW.removeFirst();
+                }
+                if (ANILIST_REQUEST_WINDOW.size() < ANILIST_SAFE_REQUESTS_PER_MINUTE) {
+                    ANILIST_REQUEST_WINDOW.addLast(now);
+                    return;
+                }
+                waitMillis = Math.max(1L, 60_000L - (now - ANILIST_REQUEST_WINDOW.peekFirst()));
+            }
+            try {
+                Thread.sleep(waitMillis);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IOException("AniList request throttling interrupted", error);
+            }
+        }
     }
 
     private static String readAll(InputStream stream) throws IOException {

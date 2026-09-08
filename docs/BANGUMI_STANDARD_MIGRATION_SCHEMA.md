@@ -1,7 +1,7 @@
 # AniLog 标准版 Bangumi 迁移 — Schema 冻结文档（Phase 0）
 
 > 分支：`codex/bangumi-standard-migration`
-> 状态：Phase 0 历史契约；当前 v0.7.1 修复线对播出权威的补充约束见 §6。
+> 状态：Phase 0 历史契约；当前 v0.7.2 修复线对播出权威的补充约束见 §6。
 > 配套（本机）进度锚点：`LOCAL_MIGRATION_PROGRESS.md`（契约基准，本文档不得与之冲突）；产品方案：`LOCAL_BANGUMI_STANDARD_MIGRATION_PLAN.md`。
 
 ## 1. 文档目的与范围
