@@ -2,7 +2,7 @@
 
 本文档面向后续维护者和 AI，记录项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
-> `v0.7.1` 已正式发布：Standard 的逐集身份/`episodeId` 权威为 Bangumi `/v0/episodes`；同一 AniList 条目且同一集号匹配时，AniList 的 `airingAt` 同时负责最终日期和分钟级时间，不能再要求与 Bangumi 日期级值同日。AniList 暂时 403 时不得用 `bangumi-data` 的周播锚点猜测后续集数；系统降级为最近一次可信 AniList 时间或日期级时间，恢复后自动纠偏。WebDAV 合并后必须用本地 Bangumi episode 缓存再愈合一次。
+> `v0.7.2` 已正式发布：在 `v0.7.1` 的 Bangumi 逐集播出权威基础上，修复分季作品 `ep`/`sort` 集号空间混用、AniList 全局集号污染季度卡片和观看任务、启动时旧任务未立即愈合，以及 Android 分季分钟级时间匹配问题。Standard 的逐集身份/`episodeId` 权威仍为 Bangumi `/v0/episodes`；AniList 只在确认同一集后提供分钟级时间。AniList 暂时 403 时不得用 `bangumi-data` 的周播锚点猜测后续集数；系统降级为最近一次可信 AniList 时间或日期级时间，恢复后自动纠偏。WebDAV 合并后必须用本地 Bangumi episode 缓存再愈合一次。
 
 ## 1. 项目现状
 
@@ -10,9 +10,9 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
-- 正式版：`v0.7.1`，GitHub Latest
-- 当前开发基线：`v0.7.1`
-- Android `versionCode`：`9`（仅 `arm64-v8a`）
+- 正式版：`v0.7.2`，GitHub Latest
+- 当前开发基线：`v0.7.2`
+- Android `versionCode`：`10`（仅 `arm64-v8a`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 
 Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。

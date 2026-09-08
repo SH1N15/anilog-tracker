@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 当前正式版：`v0.7.1`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
+- 当前正式版：`v0.7.2`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
@@ -37,4 +37,4 @@
 
 - 不把 WebDAV 账户、应用专用密码、签名密钥及其本机路径或用户状态提交到 Git。
 - 不自动提交、推送、合并 PR、发布 Release 或标记 Latest，除非用户明确授权。
-- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1`、`release/tauri-v0.6.0-beta.2`、`release/tauri-v0.6.0` 和 `release/tauri-v0.7.1` 是本机发布安装包备份且受 Git 忽略。删除前应再次征得用户同意。
+- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1`、`release/tauri-v0.6.0-beta.2`、`release/tauri-v0.6.0`、`release/tauri-v0.7.1` 和 `release/tauri-v0.7.2` 是本机发布安装包备份且受 Git 忽略。删除前应再次征得用户同意。

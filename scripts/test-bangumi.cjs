@@ -177,7 +177,13 @@ async function liveCoverage() {
   while (hasNextPage && page <= 5) {
     const response = await fetch('https://graphql.anilist.co', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, multipart/mixed',
+        Origin: 'https://anilist.co',
+        Referer: 'https://anilist.co/',
+        'User-Agent': 'AniLog/0.7 (https://github.com/SH1N15/anilog-tracker)',
+      },
       body: JSON.stringify({ query, variables: { page } }),
     });
     if (response.status === 403 || response.status === 429 || response.status >= 500) {

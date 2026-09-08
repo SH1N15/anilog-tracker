@@ -7,17 +7,18 @@ use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{Datelike, Local};
 use log::{info, warn};
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
 #[cfg(not(target_os = "android"))]
 use reqwest::header::{ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(desktop)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
@@ -46,6 +47,12 @@ const STATE_VERSION: i64 = 3;
 const SYNC_VERSION: i64 = 1;
 const CACHE_VERSION: i64 = 1;
 const BANGUMI_RESOLVER_VERSION: i64 = 5;
+// AniList documents a 90 req/min public limit, but can temporarily tighten
+// the gateway to 30 req/min. Keep the client below the stricter envelope so a
+// burst of season/authority refreshes cannot trigger a rolling 429/403.
+const ANILIST_SAFE_REQUESTS_PER_MINUTE: usize = 30;
+static ANILIST_REQUEST_WINDOW: LazyLock<tokio::sync::Mutex<VecDeque<Instant>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(VecDeque::new()));
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 const BANGUMI_EPISODES_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
 static DAILY_TASK_REMINDER_TIME_RE: LazyLock<regex::Regex> =
@@ -411,6 +418,20 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
         #[cfg(feature = "standard")]
         bangumi_username_cache: Arc::new(Mutex::new(None)),
     };
+    // 覆盖安装后先用本机最近一次成功的 Bangumi 逐集缓存修复旧状态，
+    // 再启动窗口与后台同步。这样分季条目的历史 AniList 全局集号/旧日期
+    // 不会在首次渲染时短暂显示，也不依赖 AniList 当前可达。
+    #[cfg(all(feature = "standard", not(target_os = "android")))]
+    if !original {
+        let cache_dir = bangumi_cache_dir(&context);
+        if let Ok(mut state) = context.state.lock() {
+            let _ = apply_cached_bangumi_episode_authority(
+                &mut state,
+                &cache_dir,
+                now_seconds(),
+            );
+        }
+    }
     #[cfg(not(target_os = "android"))]
     if let Err(error) = migrate_legacy_webdav_config(&context) {
         warn!("failed to migrate legacy WebDAV configuration: {error}");
@@ -2143,10 +2164,42 @@ async fn anilist_request_at(
     query: &str,
     variables: Value,
 ) -> anyhow::Result<Value> {
+    if endpoint.trim_end_matches('/') == ANILIST_API {
+        loop {
+            let delay = {
+                let mut window = ANILIST_REQUEST_WINDOW.lock().await;
+                let now = Instant::now();
+                while window.front().is_some_and(|timestamp| {
+                    now.duration_since(*timestamp) >= Duration::from_secs(60)
+                }) {
+                    window.pop_front();
+                }
+                if window.len() < ANILIST_SAFE_REQUESTS_PER_MINUTE {
+                    window.push_back(now);
+                    None
+                } else {
+                    window.front().map(|timestamp| {
+                        Duration::from_secs(60).saturating_sub(now.duration_since(*timestamp))
+                    })
+                }
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            } else {
+                break;
+            }
+        }
+    }
     let response = client
         .post(endpoint)
         .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json")
+        .header(ACCEPT, "application/json, multipart/mixed")
+        .header(ORIGIN, "https://anilist.co")
+        .header(REFERER, "https://anilist.co/")
+        .header(
+            reqwest::header::USER_AGENT,
+            "AniLog/0.7 (https://github.com/SH1N15/anilog-tracker)",
+        )
         .json(&json!({"query": query, "variables": variables}))
         .send()
         .await?;
@@ -2532,7 +2585,7 @@ async fn fetch_season_bangumi_chain(
     // 1. 缓存命中（TTL 24h）：直接返回。
     if let Some((anime, fetched_at)) = read_bangumi_season_cache(&cache_path, true) {
         return SeasonFetch::Bangumi {
-            anime,
+            anime: normalize_season_anime_episode_authority(cache_dir, anime, now_seconds()),
             fetched_at,
             stale: false,
         };
@@ -2555,6 +2608,7 @@ async fn fetch_season_bangumi_chain(
             if let Some(source) = anilist {
                 anime = anilist_enrich_season_anime(source, anime).await;
             }
+            anime = normalize_season_anime_episode_authority(cache_dir, anime, now_seconds());
             let fetched_at = now_millis();
             let entry = json!({
                 "version": CACHE_VERSION, "season": season, "year": year,
@@ -2578,7 +2632,11 @@ async fn fetch_season_bangumi_chain(
             warn!("Bangumi 季度拉取失败（{season} {year}）：{error}；尝试过期缓存兜底");
             if let Some((anime, fetched_at)) = read_bangumi_season_cache(&cache_path, false) {
                 return SeasonFetch::Bangumi {
-                    anime,
+                    anime: normalize_season_anime_episode_authority(
+                        cache_dir,
+                        anime,
+                        now_seconds(),
+                    ),
                     fetched_at,
                     stale: true,
                 };
@@ -2701,6 +2759,84 @@ fn read_bangumi_season_cache(cache_path: &Path, fresh_only: bool) -> Option<(Vec
         entry["anime"].as_array().cloned().unwrap_or_default(),
         fetched_at,
     ))
+}
+
+/// 将季度卡片中的 AniList 播出编号重新绑定到 Bangumi 分季的本地集号。
+///
+/// 季度缓存最初由 AniList 批量补充生成，分季条目可能因此携带全局/主条目
+/// 集号（例如夺还篇显示 ep16），而追番与任务使用的是该 Bangumi subject 的
+/// 本地 ep5。这里仅使用本机已经成功取得的逐集缓存，不触网、不制造周播时间；
+/// 分钟精度仍来自卡片里已有的 AniList airingSchedule，并通过日期配对处理
+/// AniList 与 Bangumi 的不同编号空间。
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn normalize_season_anime_episode_authority(
+    cache_dir: &Path,
+    mut anime: Vec<Value>,
+    now: i64,
+) -> Vec<Value> {
+    for item in anime.iter_mut() {
+        if value_string(item.get("source")) != "bangumi" {
+            continue;
+        }
+        let subject_id = value_i64(item.get("bangumiSubjectId").or_else(|| item.get("id")));
+        if subject_id <= 0 {
+            continue;
+        }
+        let Some(records) =
+            bangumi_episode_records_from_cache(cache_dir, subject_id, now, i64::MAX)
+        else {
+            continue;
+        };
+        let mut precise = HashMap::new();
+        if let Some(nodes) = item
+            .get("airingSchedule")
+            .and_then(|schedule| schedule.get("nodes"))
+            .and_then(Value::as_array)
+        {
+            for node in nodes {
+                let episode = value_i64(node.get("episode"));
+                let airing_at = value_i64(node.get("airingAt"));
+                if episode > 0 && airing_at > 0 {
+                    precise.insert(episode, airing_at);
+                }
+            }
+        }
+        if let Some(next) = item.get("nextAiringEpisode") {
+            let episode = value_i64(next.get("episode"));
+            let airing_at = value_i64(next.get("airingAt"));
+            if episode > 0 && airing_at > 0 {
+                precise.insert(episode, airing_at);
+            }
+        }
+        let schedule = bangumi_episode_schedule_with_precision(&records, now, &precise);
+        let Some((episode, _, airing_at, _)) =
+            schedule.iter().find(|(_, _, _, aired)| !*aired).copied()
+        else {
+            if !schedule.is_empty() {
+                item["nextAiringEpisode"] = Value::Null;
+            }
+            continue;
+        };
+        item["nextAiringEpisode"] = json!({
+            "episode": episode,
+            "airingAt": airing_at,
+            "timeUntilAiring": (airing_at - now).max(0),
+            "source": "bangumi_episode"
+        });
+    }
+    anime
+}
+
+#[cfg(all(feature = "standard", target_os = "android"))]
+fn normalize_season_anime_episode_authority(
+    _cache_dir: &Path,
+    anime: Vec<Value>,
+    _now: i64,
+) -> Vec<Value> {
+    // Android applies the same mapping in AniListScheduler against its local
+    // MobileStore episode cache; keep the shared season fetch free of desktop
+    // filesystem-only helpers.
+    anime
 }
 
 /// 播出选站优先级（schema §3.1）：读顶层 `bangumi.preferredBroadcastSites`，
@@ -4148,12 +4284,9 @@ fn bangumi_episode_schedule(
         if record.id <= 0 || record.ep_type != 0 {
             continue;
         }
-        let Some(sort) = record.sort else { continue };
-        let rounded = sort.round();
-        if rounded <= 0.0 || (sort - rounded).abs() >= 0.25 {
+        let Some(episode) = bangumi_sync::episode_number(record) else {
             continue;
-        }
-        let episode = rounded as i64;
+        };
         if !seen.insert(episode) {
             continue;
         }
@@ -4191,9 +4324,7 @@ fn anilist_precise_airing_from_cache(
         return HashMap::new();
     };
     let fetched_at = value_i64(cache.get("fetchedAt"));
-    if fetched_at <= 0
-        || fetched_at < (now - ANILIST_PRECISE_AIRING_CACHE_MAX_AGE_SECS) * 1_000
-    {
+    if fetched_at <= 0 || fetched_at < (now - ANILIST_PRECISE_AIRING_CACHE_MAX_AGE_SECS) * 1_000 {
         return HashMap::new();
     }
     cache["media"]
@@ -4233,15 +4364,64 @@ fn bangumi_episode_schedule_with_precision(
 ) -> Vec<(i64, i64, i64, bool)> {
     let mut schedule = bangumi_episode_schedule(records, now);
     for (episode, _, airing_at, aired) in &mut schedule {
-        let Some(candidate) = precise.get(episode).copied() else {
+        // Usually AniList and Bangumi use the same episode number. For split
+        // subjects they do not: AniList may expose the global continuation
+        // number (e.g. 16) while Bangumi's subject uses local `ep` (e.g. 5).
+        // In that case pair the precise timestamp by calendar date, which is
+        // the stable identity shared by both sources, and retain Bangumi's
+        // local episode number.
+        let record = records.iter().find(|record| {
+            record.ep_type == 0 && bangumi_sync::episode_number(record) == Some(*episode)
+        });
+        let record_date = record
+            .and_then(|record| record.airdate.as_deref())
+            .and_then(|airdate| airdate.get(..10));
+        let local_and_global = record.and_then(|record| {
+            record
+                .ep
+                .and_then(bangumi_sync::episode_sort_key)
+                .zip(record.sort.and_then(bangumi_sync::episode_sort_key))
+        });
+        let same_calendar_date = |timestamp: i64| {
+            let Some(date) = record_date else {
+                return false;
+            };
+            chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+                .map(|value| value.date_naive().to_string() == date)
+                .unwrap_or(false)
+                || chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp + 8 * 3600, 0)
+                    .map(|value| value.date_naive().to_string() == date)
+                    .unwrap_or(false)
+        };
+        let is_split_subject = local_and_global.is_some_and(|(local, global)| local != global);
+        // Split subjects must never fall back to AniList's local episode number:
+        // for Re:Zero 4th-season Dakkan, Bangumi ep=5 is not AniList ep=5.
+        // Prefer the explicit Bangumi `sort` bridge when AniList exposes the
+        // global number; otherwise pair by calendar date so a season-local
+        // AniList numbering scheme (e.g. AniList ep=16) still maps to the
+        // correct Bangumi ep=5 after a split.
+        let candidate = if is_split_subject {
+            local_and_global
+                .and_then(|(_, global)| precise.get(&global).copied())
+                .or_else(|| {
+                    precise
+                        .values()
+                        .copied()
+                        .find(|timestamp| same_calendar_date(*timestamp))
+                })
+        } else {
+            precise.get(&episode).copied().or_else(|| {
+                precise
+                    .values()
+                    .copied()
+                    .find(|timestamp| same_calendar_date(*timestamp))
+            })
+        };
+        let Some(candidate) = candidate else {
             continue;
         };
         let Some(_record) = records.iter().find(|record| {
-            record.ep_type == 0
-                && record
-                    .sort
-                    .map(|sort| (sort.round() as i64) == *episode)
-                    .unwrap_or(false)
+            record.ep_type == 0 && bangumi_sync::episode_number(record) == Some(*episode)
         }) else {
             continue;
         };
@@ -4709,12 +4889,29 @@ async fn fetch_anilist_authority_media(
 ///    流）；条目 watchedEpisode 已知（>0）且 E <= watchedEpisode → 跳过
 ///    （已看过的集不回填）。
 /// 任一变更返回 true。本窗口刚建的已播任务 episode < next.episode 不受影响。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+#[cfg(all(test, feature = "standard", not(target_os = "android")))]
 fn apply_anilist_authority_media(
     state: &mut Value,
     map: &Value,
     media_by_id: &HashMap<i64, Value>,
     now: i64,
+) -> bool {
+    apply_anilist_authority_media_inner(state, map, media_by_id, now, false)
+}
+
+/// Apply the AniList snapshot while optionally leaving Bangumi-primary entries
+/// to the per-subject Bangumi episode authority.  AniList can expose a shared
+/// global episode number for split subjects (for example 82 while the current
+/// Bangumi subject is local episode 5); writing that number directly into a
+/// Bangumi following record recreates the exact next/task corruption this path
+/// is meant to heal.
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn apply_anilist_authority_media_inner(
+    state: &mut Value,
+    map: &Value,
+    media_by_id: &HashMap<i64, Value>,
+    now: i64,
+    skip_bangumi_entries: bool,
 ) -> bool {
     if media_by_id.is_empty() {
         return false;
@@ -4739,6 +4936,12 @@ fn apply_anilist_authority_media(
             continue;
         };
         let entry_source = value_string(entry.get("source"));
+        if skip_bangumi_entries && entry_source == "bangumi" {
+            // Bangumi entries are reconciled from /v0/subjects/{id}/episodes
+            // below, with AniList timestamps used only as a minute-precision
+            // cache.  Never apply AniList's global episode number directly.
+            continue;
+        }
         let entry_anilist_id = value_i64(entry.get("anilistId"));
         // 回填所需条目字段在条目被改写前提取（后面有 following 可变借用）。
         let entry_bangumi_status = value_string(entry.get("bangumiStatus"));
@@ -4952,7 +5155,7 @@ async fn anilist_authority_refresh(
     let Ok(mut state) = state.lock() else {
         return false;
     };
-    apply_anilist_authority_media(&mut state, map, &media_by_id, now)
+    apply_anilist_authority_media_inner(&mut state, map, &media_by_id, now, true)
 }
 
 /// 第 8 轮问题 1：AniList 权威 media 缓存文件（bangumi-cache/ 下，纳入
@@ -4990,11 +5193,12 @@ fn write_anilist_authority_cache(cache_dir: &Path, media_by_id: &HashMap<i64, Va
 /// 上传，权威纠正等下一轮 sync_now 重新抓取）。now 为秒，缓存 fetchedAt 为
 /// 毫秒。
 #[cfg(all(feature = "standard", not(target_os = "android")))]
-fn apply_cached_anilist_authority(
+fn apply_cached_anilist_authority_with_mode(
     state: &mut Value,
     map: &Value,
     cache_dir: &Path,
     now: i64,
+    skip_bangumi_entries: bool,
 ) -> bool {
     let Ok(raw) = fs::read_to_string(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE)) else {
         return false;
@@ -5019,7 +5223,20 @@ fn apply_cached_anilist_authority(
     if media_by_id.is_empty() {
         return false;
     }
-    apply_anilist_authority_media(state, map, &media_by_id, now)
+    apply_anilist_authority_media_inner(state, map, &media_by_id, now, skip_bangumi_entries)
+}
+
+#[cfg(all(test, feature = "standard", not(target_os = "android")))]
+fn apply_cached_anilist_authority(
+    state: &mut Value,
+    map: &Value,
+    cache_dir: &Path,
+    now: i64,
+) -> bool {
+    // Unit fixtures exercise the standalone AniList authority kernel. The
+    // production WebDAV path uses the split-aware mode below and then applies
+    // cached Bangumi episode authority as the final source of truth.
+    apply_cached_anilist_authority_with_mode(state, map, cache_dir, now, false)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -5120,7 +5337,19 @@ async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, 
         // 主条目（治愈被离线锚点污染的存量值；离线调度已跳过 anilistId 条目，
         // 不会再在其后覆写）。
         #[cfg(feature = "standard")]
-        let secondary_claimants = secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
+        let mut secondary_claimants =
+            secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
+        #[cfg(feature = "standard")]
+        if let Some(items) = state["following"].as_array() {
+            // Standard Bangumi entries are reconciled by their subject episode
+            // table.  Do not let the shared AniList schedule transiently create
+            // global-numbered tasks before that reconciliation runs.
+            secondary_claimants.extend(items.iter().filter_map(|item| {
+                (value_string(item.get("source")) == "bangumi")
+                    .then(|| value_i64(item.get("id")))
+                    .filter(|id| *id > 0)
+            }));
+        }
         #[cfg(not(feature = "standard"))]
         let secondary_claimants = HashSet::new();
         apply_airing_schedules_inner(&mut state, &schedules, now, &secondary_claimants)
@@ -6633,8 +6862,8 @@ mod bangumi_sync {
         })
     }
 
-    /// sort 数值 → 任务集数键（整数）：round 相等且 |sort - ep| < 0.25 才映射
-    /// （验收第 4 轮问题 2：SP 等特殊集的 sort "4.5" 不得错配第 4 或第 5 集）。
+    /// sort/ep 数值 → 任务集数键（整数）：round 相等且 |value - ep| < 0.25 才映射
+    /// （验收第 4 轮问题 2：SP 等特殊集的 4.5 不得错配第 4 或第 5 集）。
     pub(super) fn episode_sort_key(sort: f64) -> Option<i64> {
         let rounded = sort.round();
         if rounded > 0.0 && (sort - rounded).abs() < 0.25 {
@@ -6644,6 +6873,17 @@ mod bangumi_sync {
         }
     }
 
+    /// Bangumi 的 `sort` 是作品全局顺序，而 `ep` 是当前 subject/分季的本地
+    /// 集号。标准版任务和 AniList 的 `nextAiringEpisode` 都使用后者；若优先
+    /// 使用 sort，分季条目（例如 Re: 从零第四季夺还篇 sort=78..）会被误当成
+    /// 第 78 集，导致 next 为空、任务被标记为无日程或随后清掉。
+    pub(super) fn episode_number(episode: &bangumi::BangumiEpisode) -> Option<i64> {
+        episode
+            .ep
+            .and_then(episode_sort_key)
+            .or_else(|| episode.sort.and_then(episode_sort_key))
+    }
+
     /// 集数记录 → {任务集数: episode_id}；同键冲突取更贴近整数的记录。
     pub(super) fn episode_id_map(episodes: &[bangumi::BangumiEpisode]) -> BTreeMap<i64, i64> {
         let mut best: BTreeMap<i64, (i64, f64)> = BTreeMap::new();
@@ -6651,13 +6891,15 @@ mod bangumi_sync {
             if episode.id <= 0 {
                 continue;
             }
-            let Some(sort) = episode.sort else {
+            let Some(key) = episode_number(episode) else {
                 continue;
             };
-            let Some(key) = episode_sort_key(sort) else {
-                continue;
-            };
-            let distance = (sort - key as f64).abs();
+            let value = episode
+                .ep
+                .filter(|ep| episode_sort_key(*ep) == Some(key))
+                .or(episode.sort)
+                .unwrap_or(key as f64);
+            let distance = (value - key as f64).abs();
             match best.get(&key) {
                 Some((_, existing)) if *existing <= distance => {}
                 _ => {
@@ -8550,11 +8792,12 @@ async fn perform_webdav_sync(app: &AppHandle, context: &AppContext) -> anyhow::R
                     // 不触网）——云端复活的小时级假票当次上传前再死一次，上传
                     // 文档自愈；无/过期缓存 → false 跳过（权威纠正由 sync_now
                     // 重新抓取承担）。
-                    if apply_cached_anilist_authority(
+                    if apply_cached_anilist_authority_with_mode(
                         &mut state,
                         &context.offline_bangumi,
                         &bangumi_cache_dir(context),
                         now_seconds(),
+                        true,
                     ) {
                         local_changed = true;
                         merged = document_from_state(&mut state);
@@ -12274,6 +12517,47 @@ mod tests {
         assert_eq!(map.len(), 3, "4.5 / 无 sort / 0.0 不映射");
     }
 
+    #[cfg(feature = "standard")]
+    #[test]
+    fn episode_number_prefers_local_ep_over_global_sort_for_split_subjects() {
+        let episodes = vec![
+            bangumi::BangumiEpisode {
+                id: 10,
+                ep: Some(5.0),
+                sort: Some(82.0),
+                ..Default::default()
+            },
+            bangumi::BangumiEpisode {
+                id: 11,
+                ep: None,
+                sort: Some(83.0),
+                ..Default::default()
+            },
+        ];
+        let map = bangumi_sync::episode_id_map(&episodes);
+        assert_eq!(map.get(&5), Some(&10));
+        assert_eq!(map.get(&83), Some(&11));
+        assert!(!map.contains_key(&82));
+
+        let records = [bangumi::BangumiEpisode {
+            id: 12,
+            ep: Some(5.0),
+            sort: Some(82.0),
+            airdate: Some("2026-09-12".into()),
+            ..Default::default()
+        }];
+        let precise = HashMap::from([(82, at("2026-09-12T13:30:00+00:00"))]);
+        let schedule = bangumi_episode_schedule_with_precision(
+            &records,
+            at("2026-09-08T12:00:00+00:00"),
+            &precise,
+        );
+        assert_eq!(
+            schedule,
+            vec![(5, 12, at("2026-09-12T13:30:00+00:00"), false)]
+        );
+    }
+
     /// 验收第 4 轮问题 1b：离线锚点与 AniList 权威冲突时，任务生成被钳制——
     /// 只生成 episode < AniList nextAiringEpisode.episode 的已播集；无 AniList
     /// 数据时维持离线推算（含 airingAt == now 边界、未来集不生成）。
@@ -12573,6 +12857,41 @@ mod tests {
                 "airingSchedule": {"nodes": schedule}
             }),
         )
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn production_anilist_authority_never_writes_global_episode_numbers_to_bangumi_entries() {
+        // Re:Zero 的两个 Bangumi subject 共用一个 AniList media。AniList 在该
+        // media 中使用全集序号 82，而夺还篇必须展示/创建本分季的第 5 集。生产
+        // 同步只能把该响应留作分钟级缓存，随后由 Bangumi episode 表按本地 ep
+        // 归属，绝不能先写入 82 再等待下一步纠正。
+        let mut state = default_state(false);
+        state["following"] = json!([{
+            "id": 633836, "source": "bangumi", "anilistId": 189046,
+            "displayTitle": "夺还篇", "episodes": 8,
+            "nextAiringEpisode": {"episode": 5, "airingAt": at("2026-09-12T21:00:00+08:00")}
+        }]);
+        state["tasks"] = json!([{
+            "id": "633836-4", "animeId": 633836, "episode": 4,
+            "airingAt": at("2026-09-05T21:00:00+08:00"), "status": "pending"
+        }]);
+        let before = state.clone();
+        let map = json!({"bySubject": {}, "anilistIndex": {"189046": 547888}});
+        let media = HashMap::from([authority_media(
+            189046,
+            json!({"episode": 82, "airingAt": at("2026-09-12T21:00:00+08:00")}),
+            json!([{"episode": 81, "airingAt": at("2026-09-05T21:00:00+08:00")}]),
+        )]);
+
+        assert!(!apply_anilist_authority_media_inner(
+            &mut state,
+            &map,
+            &media,
+            at("2026-09-08T12:00:00+08:00"),
+            true,
+        ));
+        assert_eq!(state, before);
     }
 
     #[cfg(feature = "standard")]
@@ -15692,26 +16011,70 @@ mod tests {
             Some((1701430, false))
         );
         let precise = HashMap::from([(23, at("2026-09-12T13:30:00+00:00"))]);
-        let precise_schedule = bangumi_episode_schedule_with_precision(&records[..2], now, &precise);
+        let precise_schedule =
+            bangumi_episode_schedule_with_precision(&records[..2], now, &precise);
         assert_eq!(
-            precise_schedule.iter().find(|(episode, _, _, _)| *episode == 23).map(|(_, _, airing_at, _)| *airing_at),
+            precise_schedule
+                .iter()
+                .find(|(episode, _, _, _)| *episode == 23)
+                .map(|(_, _, airing_at, _)| *airing_at),
             Some(at("2026-09-12T13:30:00+00:00"))
         );
         assert_eq!(
-            precise_schedule.iter().find(|(episode, _, _, _)| *episode == 23).map(|(_, _, _, aired)| *aired),
+            precise_schedule
+                .iter()
+                .find(|(episode, _, _, _)| *episode == 23)
+                .map(|(_, _, _, aired)| *aired),
             Some(false),
             "AniList 的未来精确时间必须覆盖 Bangumi 错误的已播日期判断"
         );
         let mismatched = HashMap::from([(23, at("2026-09-13T13:30:00+00:00"))]);
-        let safe_schedule = bangumi_episode_schedule_with_precision(&records[..2], now, &mismatched);
+        let safe_schedule =
+            bangumi_episode_schedule_with_precision(&records[..2], now, &mismatched);
         assert_eq!(
-            safe_schedule.iter().find(|(episode, _, _, _)| *episode == 23).map(|(_, _, airing_at, _)| *airing_at),
+            safe_schedule
+                .iter()
+                .find(|(episode, _, _, _)| *episode == 23)
+                .map(|(_, _, airing_at, _)| *airing_at),
             Some(at("2026-09-13T13:30:00+00:00"))
         );
         assert_eq!(
-            safe_schedule.iter().find(|(episode, _, _, _)| *episode == 23).map(|(_, _, _, aired)| *aired),
+            safe_schedule
+                .iter()
+                .find(|(episode, _, _, _)| *episode == 23)
+                .map(|(_, _, _, aired)| *aired),
             Some(false),
             "改档后的 AniList 日期也必须作为未来集门禁"
+        );
+    }
+
+    #[cfg(feature = "standard")]
+    #[test]
+    fn split_subject_precision_never_falls_back_to_local_anilist_number() {
+        let now = at("2026-09-07T12:00:00+00:00");
+        let records = vec![bangumi::BangumiEpisode {
+            id: 1656862,
+            ep_type: 0,
+            ep: Some(5.0),
+            sort: Some(82.0),
+            airdate: Some("2026-09-09".into()),
+            ..Default::default()
+        }];
+        // AniList's local ep5 is an old May date; its current split-season ep16
+        // is the September 9 airing that belongs to Bangumi local ep5.
+        let precise = HashMap::from([
+            (5, at("2026-05-06T13:00:00+00:00")),
+            (16, at("2026-09-09T13:00:00+00:00")),
+        ]);
+        let schedule = bangumi_episode_schedule_with_precision(&records, now, &precise);
+        assert_eq!(
+            schedule,
+            vec![(
+                5,
+                1656862,
+                at("2026-09-09T13:00:00+00:00"),
+                false
+            )]
         );
     }
 
@@ -15751,21 +16114,84 @@ mod tests {
              "completedAt": at("2026-09-06T01:00:00+00:00")}
         ]);
         let records = [
-            (568572, vec![
-                bangumi::BangumiEpisode { id: 1575796, ep_type: 0, sort: Some(22.0), airdate: Some("2026-09-05".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1575797, ep_type: 0, sort: Some(23.0), airdate: Some("2026-09-12".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1575798, ep_type: 0, sort: Some(24.0), airdate: Some("2026-09-19".into()), ..Default::default() },
-            ]),
-            (545917, vec![
-                bangumi::BangumiEpisode { id: 1705016, ep_type: 0, sort: Some(9.0), airdate: Some("2026-09-04".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1705017, ep_type: 0, sort: Some(10.0), airdate: Some("2026-09-11".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1705018, ep_type: 0, sort: Some(11.0), airdate: Some("2026-09-18".into()), ..Default::default() },
-            ]),
-            (622206, vec![
-                bangumi::BangumiEpisode { id: 1701429, ep_type: 0, sort: Some(9.0), airdate: Some("2026-09-03".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1701430, ep_type: 0, sort: Some(10.0), airdate: Some("2026-09-10".into()), ..Default::default() },
-                bangumi::BangumiEpisode { id: 1701431, ep_type: 0, sort: Some(11.0), airdate: Some("2026-09-17".into()), ..Default::default() },
-            ]),
+            (
+                568572,
+                vec![
+                    bangumi::BangumiEpisode {
+                        id: 1575796,
+                        ep_type: 0,
+                        sort: Some(22.0),
+                        airdate: Some("2026-09-05".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1575797,
+                        ep_type: 0,
+                        sort: Some(23.0),
+                        airdate: Some("2026-09-12".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1575798,
+                        ep_type: 0,
+                        sort: Some(24.0),
+                        airdate: Some("2026-09-19".into()),
+                        ..Default::default()
+                    },
+                ],
+            ),
+            (
+                545917,
+                vec![
+                    bangumi::BangumiEpisode {
+                        id: 1705016,
+                        ep_type: 0,
+                        sort: Some(9.0),
+                        airdate: Some("2026-09-04".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1705017,
+                        ep_type: 0,
+                        sort: Some(10.0),
+                        airdate: Some("2026-09-11".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1705018,
+                        ep_type: 0,
+                        sort: Some(11.0),
+                        airdate: Some("2026-09-18".into()),
+                        ..Default::default()
+                    },
+                ],
+            ),
+            (
+                622206,
+                vec![
+                    bangumi::BangumiEpisode {
+                        id: 1701429,
+                        ep_type: 0,
+                        sort: Some(9.0),
+                        airdate: Some("2026-09-03".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1701430,
+                        ep_type: 0,
+                        sort: Some(10.0),
+                        airdate: Some("2026-09-10".into()),
+                        ..Default::default()
+                    },
+                    bangumi::BangumiEpisode {
+                        id: 1701431,
+                        ep_type: 0,
+                        sort: Some(11.0),
+                        airdate: Some("2026-09-17".into()),
+                        ..Default::default()
+                    },
+                ],
+            ),
         ];
         for (subject_id, episodes) in records {
             assert!(apply_bangumi_episode_records_to_state(
@@ -15776,11 +16202,16 @@ mod tests {
         assert_eq!(state["following"][1]["nextAiringEpisode"]["episode"], 10);
         assert_eq!(state["following"][2]["nextAiringEpisode"]["episode"], 10);
         let pending: Vec<String> = state["tasks"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .filter(|task| value_string(task.get("status")) == "pending")
             .map(|task| value_string(task.get("id")))
             .collect();
-        assert!(pending.is_empty(), "旧周播偏移产生的三条未来假票必须清理: {pending:?}");
+        assert!(
+            pending.is_empty(),
+            "旧周播偏移产生的三条未来假票必须清理: {pending:?}"
+        );
         assert_eq!(state["tasks"].as_array().unwrap().len(), 1);
         assert_eq!(state["tasks"][0]["status"], "completed");
         assert_eq!(state["tasks"][0]["episodeId"], 1575796);
