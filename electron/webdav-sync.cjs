@@ -150,9 +150,27 @@ function mergeDocumentIntoState(state, remoteValue) {
   const followingIds = new Set([...localFollowing.keys(), ...remoteFollowing.keys(), ...Object.keys(tombstones).map(Number)]);
   const mergedFollowing = [];
   for (const id of followingIds) {
-    const winner = chooseRecord(localFollowing.get(id), remoteFollowing.get(id), 'followedAt');
     const deletedAt = asTimestamp(tombstones[String(id)]);
-    if (winner && recordTimestamp(winner, 'followedAt') > deletedAt) mergedFollowing.push(winner);
+    const localCandidate = localFollowing.get(id);
+    const localIntent = asTimestamp(localCandidate?.localFollowIntentAt);
+    const remotePulled = asTimestamp(localCandidate?.lastPulledFromBangumiAt);
+    const localRefollow = localCandidate && localIntent > 0
+      && (localIntent > deletedAt || remotePulled <= 0 || localIntent > remotePulled * 1000);
+    const winner = localRefollow
+      ? clone(localCandidate)
+      : chooseRecord(localCandidate, remoteFollowing.get(id), 'followedAt');
+    const localIntentAt = asTimestamp(winner?.localFollowIntentAt);
+    const remotePulledAt = asTimestamp(winner?.lastPulledFromBangumiAt);
+    if (winner && localIntentAt > 0
+      && (localIntentAt > deletedAt || remotePulledAt <= 0 || localIntentAt > remotePulledAt * 1000)) {
+      // A local re-follow is a fresh user intent.  Do not let an older
+      // WebDAV tombstone erase it; dropping the tombstone also makes the
+      // desktop fallback implementation converge with Rust/Android.
+      delete tombstones[String(id)];
+      mergedFollowing.push(winner);
+    } else if (winner && recordTimestamp(winner, 'followedAt') > deletedAt) {
+      mergedFollowing.push(winner);
+    }
   }
   mergedFollowing.sort((left, right) => left.id - right.id);
 

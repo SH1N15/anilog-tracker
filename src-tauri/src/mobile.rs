@@ -74,6 +74,9 @@ fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
                 "anilistId": if anilist_id > 0 { json!(anilist_id) } else { Value::Null },
                 "bangumiStatus": item.get("bangumiStatus").cloned().unwrap_or(Value::Null),
                 "followedAt": value_i64(item.get("followedAt")),
+                "syncUpdatedAt": value_i64(item.get("syncUpdatedAt")),
+                "lastChangedBy": item.get("lastChangedBy").cloned().unwrap_or(Value::Null),
+                "localFollowIntentAt": value_i64(item.get("localFollowIntentAt")),
                 "watchedEpisode": item.get("watchedEpisode").cloned().unwrap_or(Value::Null)
             })
         })

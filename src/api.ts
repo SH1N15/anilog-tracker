@@ -321,13 +321,46 @@ async function browserFetchSeasonFromNetwork(params: { season: Season; year: num
 }
 
 type BrowserSeasonCacheEntry = { anime: Anime[]; fetchedAt: number };
-const MOBILE_SEASON_CACHE_KEY = 'anilog-android-season-cache-v1';
+// Keep the Android season snapshot deliberately small.  WebView localStorage is
+// commonly limited to ~5 MB; storing descriptions, banners and all Bangumi
+// extras for eight seasons silently evicted the cache on real devices.
+const MOBILE_SEASON_CACHE_KEY = 'anilog-android-season-cache-v2';
+const MOBILE_SEASON_CACHE_LEGACY_KEY = 'anilog-android-season-cache-v1';
+const MOBILE_SEASON_CACHE_MAX_ENTRIES = 4;
+
+function compactSeasonAnime(anime: Anime[]): Anime[] {
+  return anime.map((item) => ({
+    id: item.id,
+    title: item.title,
+    coverImage: item.coverImage,
+    format: item.format,
+    episodes: item.episodes,
+    duration: item.duration,
+    status: item.status,
+    season: item.season,
+    seasonYear: item.seasonYear,
+    startDate: item.startDate,
+    studios: item.studios,
+    genres: item.genres,
+    averageScore: item.averageScore,
+    popularity: item.popularity,
+    nextAiringEpisode: item.nextAiringEpisode,
+    airingSchedule: item.airingSchedule,
+    siteUrl: item.siteUrl,
+    source: item.source,
+    bangumiSubjectId: item.bangumiSubjectId,
+    anilistId: item.anilistId,
+  }));
+}
 
 function loadBrowserSeasonCache(): Map<string, BrowserSeasonCacheEntry> {
   if (!IS_ANDROID_APP) return new Map();
   try {
-    const stored = JSON.parse(localStorage.getItem(MOBILE_SEASON_CACHE_KEY) || '{}') as Record<string, BrowserSeasonCacheEntry>;
-    return new Map(Object.entries(stored).filter(([, entry]) => Number.isFinite(entry?.fetchedAt) && Array.isArray(entry?.anime)));
+    const raw = localStorage.getItem(MOBILE_SEASON_CACHE_KEY) || localStorage.getItem(MOBILE_SEASON_CACHE_LEGACY_KEY) || '{}';
+    const stored = JSON.parse(raw) as Record<string, BrowserSeasonCacheEntry>;
+    return new Map(Object.entries(stored)
+      .filter(([, entry]) => Number.isFinite(entry?.fetchedAt) && Array.isArray(entry?.anime))
+      .map(([key, entry]) => [key, { fetchedAt: entry.fetchedAt, anime: compactSeasonAnime(entry.anime) }]));
   } catch {
     return new Map();
   }
@@ -342,17 +375,31 @@ function persistBrowserSeasonCache() {
   if (!IS_ANDROID_APP) return;
   const recent = [...browserSeasonCache.entries()]
     .sort(([, first], [, second]) => second.fetchedAt - first.fetchedAt)
-    .slice(0, 8);
+    .slice(0, MOBILE_SEASON_CACHE_MAX_ENTRIES)
+    .map(([key, entry]) => [key, { fetchedAt: entry.fetchedAt, anime: compactSeasonAnime(entry.anime) }] as const);
   try {
     localStorage.setItem(MOBILE_SEASON_CACHE_KEY, JSON.stringify(Object.fromEntries(recent)));
+    // Do not leave the pre-v2 full snapshots beside the compact cache: they
+    // count against the same WebView quota and can make the next refresh fail.
+    localStorage.removeItem(MOBILE_SEASON_CACHE_LEGACY_KEY);
   } catch {
     try {
-      const compact = recent.slice(0, 3);
-      localStorage.setItem(MOBILE_SEASON_CACHE_KEY, JSON.stringify(Object.fromEntries(compact)));
+      // A previous v1 snapshot may still occupy the quota. Remove it before
+      // retrying, then retain only the newest snapshot as the guaranteed fast
+      // path for the currently viewed season.
+      localStorage.removeItem(MOBILE_SEASON_CACHE_LEGACY_KEY);
+      localStorage.setItem(MOBILE_SEASON_CACHE_KEY, JSON.stringify(Object.fromEntries(recent.slice(0, 1))));
     } catch {
       // The list still remains available in memory when WebView storage is full.
     }
   }
+}
+
+// Migrate a readable v1 snapshot immediately. This is intentionally best
+// effort: if the old value is already over quota, the retry removes it and
+// keeps the newest compact entry only.
+if (IS_ANDROID_APP && localStorage.getItem(MOBILE_SEASON_CACHE_LEGACY_KEY)) {
+  persistBrowserSeasonCache();
 }
 
 function browserSeasonKey({ season, year }: { season: Season; year: number }): string {

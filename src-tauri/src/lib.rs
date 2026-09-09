@@ -2029,13 +2029,40 @@ fn merge_document_into_state(
         .collect();
     let mut following = Vec::new();
     for id in ids {
-        if let Some(winner) = choose_record(
-            local_following.get(&id),
-            remote_following.get(&id),
-            "followedAt",
-        ) {
-            if record_timestamp(&winner, "followedAt") > *deleted.get(&id.to_string()).unwrap_or(&0)
-            {
+        let local_record = local_following.get(&id);
+        let deleted_at = *deleted.get(&id.to_string()).unwrap_or(&0);
+        let local_is_refollow = local_record.is_some_and(|item| {
+            let intent_at = value_i64(item.get("localFollowIntentAt"));
+            let remote_at = value_i64(item.get("lastPulledFromBangumiAt"));
+            intent_at > 0
+                && (intent_at > deleted_at || remote_at <= 0 || intent_at > remote_at.saturating_mul(1_000))
+        });
+        let winner = if local_is_refollow {
+            local_following.get(&id).cloned()
+        } else {
+            choose_record(
+                local_following.get(&id),
+                remote_following.get(&id),
+                "followedAt",
+            )
+        };
+        if let Some(winner) = winner {
+            let deleted_at = *deleted.get(&id.to_string()).unwrap_or(&0);
+            let local_refollow = {
+                    let intent_at = value_i64(winner.get("localFollowIntentAt"));
+                    let remote_at = value_i64(winner.get("lastPulledFromBangumiAt"));
+                    intent_at > 0
+                        && (intent_at > deleted_at
+                            || remote_at <= 0
+                            || intent_at > remote_at.saturating_mul(1_000))
+                };
+            if local_refollow {
+                // An explicit local re-follow is a new user intent.  A stale
+                // WebDAV tombstone must not erase it; clear the tombstone so
+                // every device converges to the live record.
+                deleted.remove(&id.to_string());
+                following.push(winner);
+            } else if record_timestamp(&winner, "followedAt") > deleted_at {
                 following.push(winner);
             }
         }
@@ -2355,6 +2382,63 @@ async fn fetch_season(
             (state.clone(), base)
         };
         let cache_dir = bangumi_cache_dir(&context);
+        // Cache-first season loading: an expired but valid snapshot is useful
+        // immediately.  Refresh in the background and notify the UI when the
+        // new snapshot is ready instead of blocking the first screen for all
+        // month pages plus AniList enrichment.
+        if let Some((cached_anime, cached_at)) =
+            read_bangumi_season_cache(&cache_dir.join(format!("{year}-{season}.json")), false)
+        {
+            if now_millis().saturating_sub(cached_at) >= BANGUMI_SEASON_TTL_MILLIS {
+                let stale_anime = normalize_season_anime_episode_authority(
+                    &cache_dir,
+                    cached_anime,
+                    now_seconds(),
+                );
+                let refresh_context = context.inner().clone();
+                let refresh_app = app.clone();
+                let refresh_season = season.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state_snapshot = match refresh_context.state.lock() {
+                        Ok(state) => state.clone(),
+                        Err(_) => return,
+                    };
+                    let base = bangumi_base_urls(&state_snapshot);
+                    let source = AniListSeasonSource {
+                        client: &refresh_context.client,
+                        endpoint: ANILIST_API,
+                    };
+                    if let SeasonFetch::Bangumi {
+                        anime,
+                        fetched_at,
+                        stale,
+                    } = fetch_season_bangumi_chain(
+                        &refresh_context.client,
+                        base,
+                        &cache_dir,
+                        &refresh_context.offline_bangumi,
+                        &state_snapshot,
+                        &refresh_season,
+                        year,
+                        Some(&source),
+                    )
+                    .await
+                    {
+                        let _ = refresh_app.emit(
+                            "season-updated",
+                            json!({
+                                "season": refresh_season,
+                                "year": year,
+                                "anime": anime,
+                                "fetchedAt": fetched_at,
+                                "stale": stale
+                            }),
+                        );
+                    }
+                });
+                return Ok(stale_anime);
+            }
+        }
         let anilist_source = AniListSeasonSource {
             client: &context.client,
             endpoint: ANILIST_API,
@@ -3208,6 +3292,21 @@ fn mark_following_local_change(state: &mut Value, subject_id: i64) {
     }
 }
 
+/// Mark an explicit local follow/re-follow intent.  This is deliberately
+/// separate from ordinary edits such as rating, title, or Bangumi status:
+/// only a follow action may override an older remote `dropped` tombstone.
+#[cfg(feature = "standard")]
+fn mark_following_refollow_intent(state: &mut Value, subject_id: i64) {
+    mark_following_local_change(state, subject_id);
+    if let Some(entry) = state["following"].as_array_mut().and_then(|items| {
+        items
+            .iter_mut()
+            .find(|item| value_i64(item.get("id")) == subject_id)
+    }) {
+        entry["localFollowIntentAt"] = json!(now_millis());
+    }
+}
+
 /// 跨键重追守卫的身份解析（standard）：返回该作品已知的
 /// (subjectId=S, anilistId=A) 身份对（缺失侧为 0）。Bangumi 卡片以卡片值优先，
 /// anilistId 缺失时经离线映射兜底（bySubject[S].a 直查或 anilistIndex 反查）；
@@ -3330,17 +3429,19 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value, map: &Value) {
             enrich_following_entry_from_anime(state, subject_id, anime);
             bind_manual_mapping(state, subject_id);
             mark_following_changed(state, subject_id);
-            mark_following_local_change(state, subject_id);
+            mark_following_refollow_intent(state, subject_id);
         } else if same_subject_exists {
             enrich_following_entry_from_anime(state, subject_id, anime);
             bind_manual_mapping(state, subject_id);
             mark_following_changed(state, subject_id);
-            mark_following_local_change(state, subject_id);
+            mark_following_refollow_intent(state, subject_id);
         } else {
             // 问题 2a：本地追番 → lastChangedBy=local（写回引擎据此 POST）。
             entry["lastChangedBy"] = json!("local");
+            entry["localFollowIntentAt"] = json!(now_millis());
             state["following"].as_array_mut().unwrap().push(entry);
             mark_following_changed(state, subject_id);
+            mark_following_refollow_intent(state, subject_id);
             // 对称复活：旧 AniList 键条目此前被用户取消（A 墓碑残留）→ 重追
             // 即撤销删除意图，一并清 A 墓碑，防止残留墓碑阻止复活语义。
             if identity_anilist > 0 && following_tombstone_exists(state, identity_anilist) {
@@ -3373,9 +3474,11 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value, map: &Value) {
             }
             let mut entry = bangumi_following_entry(&card, &preference, &language);
             entry["lastChangedBy"] = json!("local");
+            entry["localFollowIntentAt"] = json!(now_millis());
             state["following"].as_array_mut().unwrap().push(entry);
             // mark_following_changed 语义：清 S 墓碑（复活）。
             mark_following_changed(state, identity_subject);
+            mark_following_refollow_intent(state, identity_subject);
             // A 键若也残留墓碑（该作品曾以 A 键被取消）一并清除。
             if identity_anilist > 0 && following_tombstone_exists(state, identity_anilist) {
                 mark_following_changed(state, identity_anilist);
@@ -3402,8 +3505,10 @@ fn add_following_entry_standard(state: &mut Value, anime: &Value, map: &Value) {
                     entry["mappingPending"] = json!(false);
                     entry["syncUpdatedAt"] = json!(now_millis());
                     entry["lastChangedBy"] = json!("local");
+                    entry["localFollowIntentAt"] = json!(now_millis());
                 }
                 mark_following_changed(state, entry_id);
+                mark_following_refollow_intent(state, entry_id);
             } else {
                 let entry = anilist_following_entry(state, anime, false);
                 state["following"].as_array_mut().unwrap().push(entry);
@@ -4216,6 +4321,28 @@ fn bangumi_episode_airdate_is_aired(airdate: &str, now: i64) -> Option<bool> {
 }
 
 #[cfg(all(feature = "standard", not(target_os = "android")))]
+fn bangumi_episode_before_follow(airdate: &str, followed_at: i64) -> bool {
+    if followed_at <= 0 {
+        return false;
+    }
+    let value = airdate.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return timestamp.timestamp() < followed_at;
+    }
+    let Ok(air_date) = chrono::NaiveDate::parse_from_str(value.get(..10).unwrap_or_default(), "%Y-%m-%d") else {
+        return false;
+    };
+    let Some(follow_date) = chrono::DateTime::<chrono::Utc>::from_timestamp(followed_at, 0)
+        .map(|value| value.date_naive()) else {
+        return false;
+    };
+    air_date < follow_date
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
 fn bangumi_episode_records_from_cache(
     cache_dir: &Path,
     subject_id: i64,
@@ -4470,6 +4597,7 @@ fn apply_bangumi_episode_records_to_state(
     };
     let aliases = [subject_id, value_i64(entry.get("anilistId"))];
     let watched_episode = value_i64(entry.get("watchedEpisode"));
+    let followed_at = value_i64(entry.get("followedAt"));
     let status = value_string(entry.get("bangumiStatus"));
     let tracking = status.is_empty() || status == "doing";
     let next = schedule.iter().find(|(_, _, _, aired)| !*aired).copied();
@@ -4527,6 +4655,15 @@ fn apply_bangumi_episode_records_to_state(
             .copied()
         else {
             if !completed {
+                let max_known = records
+                    .iter()
+                    .filter_map(bangumi_sync::episode_number)
+                    .max()
+                    .unwrap_or(0);
+                if max_known > 0 && episode > max_known {
+                    changed = true;
+                    return false;
+                }
                 task["needsScheduleReview"] = json!(true);
                 task["scheduleReviewReason"] = json!("Bangumi episode airdate unavailable");
                 changed = true;
@@ -4568,7 +4705,19 @@ fn apply_bangumi_episode_records_to_state(
     });
     if create_tasks && tracking {
         for (episode, episode_id, airing_at, aired) in &schedule {
-            if !*aired || *episode <= watched_episode || known.contains(episode) {
+            if !*aired
+                || *episode <= watched_episode
+                || known.contains(episode)
+                || (followed_at > 0
+                    && records
+                        .iter()
+                        .find(|record| {
+                            record.ep_type == 0
+                                && bangumi_sync::episode_number(record) == Some(*episode)
+                        })
+                        .and_then(|record| record.airdate.as_deref())
+                        .is_some_and(|airdate| bangumi_episode_before_follow(airdate, followed_at)))
+            {
                 continue;
             }
             tasks.push(json!({
@@ -4637,6 +4786,7 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
         }
         let next = schedule.iter().find(|(_, _, _, aired)| !*aired).cloned();
         let watched_episode = value_i64(entry.get("watchedEpisode"));
+        let followed_at = value_i64(entry.get("followedAt"));
         let status = value_string(entry.get("bangumiStatus"));
         let tracking = status.is_empty() || status == "doing";
         let mut state = match context.state.lock() {
@@ -4703,6 +4853,15 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 .copied()
             else {
                 if value_string(task.get("status")) == "pending" {
+                    let max_known = records
+                        .iter()
+                        .filter_map(bangumi_sync::episode_number)
+                        .max()
+                        .unwrap_or(0);
+                    if max_known > 0 && episode > max_known {
+                        changed = true;
+                        return false;
+                    }
                     task["needsScheduleReview"] = json!(true);
                     task["scheduleReviewReason"] = json!("Bangumi episode airdate unavailable");
                     changed = true;
@@ -4741,7 +4900,19 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
         });
         if create_tasks && tracking {
             for (episode, episode_id, airing_at, aired) in &schedule {
-                if !*aired || *episode <= watched_episode || known.contains(episode) {
+                if !*aired
+                    || *episode <= watched_episode
+                    || known.contains(episode)
+                    || (followed_at > 0
+                        && records
+                            .iter()
+                            .find(|record| {
+                                record.ep_type == 0
+                                    && bangumi_sync::episode_number(record) == Some(*episode)
+                            })
+                            .and_then(|record| record.airdate.as_deref())
+                            .is_some_and(|airdate| bangumi_episode_before_follow(airdate, followed_at)))
+                {
                     continue;
                 }
                 let task = json!({
@@ -5096,7 +5267,14 @@ fn apply_anilist_authority_media_inner(
             for (episode, airing_at) in aired_airing {
                 if (next_episode > 0 && episode >= next_episode)
                     || known_episodes.contains(&episode)
-                    || (entry_followed_at > 0 && airing_at < entry_followed_at)
+                    || (entry_followed_at > 0
+                        && media["airingSchedule"]["nodes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|node| value_i64(node.get("episode")) == episode)
+                            .and_then(|node| node.get("airingAt"))
+                            .is_some_and(|value| value_i64(Some(value)) < entry_followed_at))
                     || (entry_watched_episode > 0 && episode <= entry_watched_episode)
                 {
                     continue;
@@ -6423,10 +6601,6 @@ mod bangumi_sync {
             .is_some_and(|id| id > 0)
     }
 
-    fn tombstone_exists(state: &Value, subject_id: i64) -> bool {
-        value_i64(state["syncMetadata"]["followingDeletedAt"].get(&subject_id.to_string())) > 0
-    }
-
     /// 任务 2：拉取合并引擎。前置：Token 且 `bangumi.syncEnabled` 且
     /// `pullCollections`，否则返回零值报告（skipped，调用方按语义给 message）。
     pub(super) async fn run_bangumi_collection_sync(
@@ -6536,12 +6710,17 @@ mod bangumi_sync {
                             subject: None,
                         });
                     }
-                    // wish/on_hold → 仅建议；doing 但墓碑存在 → 本地删除优先，
-                    // 不自动恢复，计入建议。
-                    1 | 3 | 4 => report.suggestions.push(bangumi::BangumiSyncSuggestion {
+                    // wish/on_hold 仅建议。doing 即使存在旧墓碑也必须恢复：
+                    // 墓碑代表过去的本地取消，不应覆盖当前 Bangumi 的在看状态。
+                    1 | 4 => report.suggestions.push(bangumi::BangumiSyncSuggestion {
                         subject_id,
                         name_cn: collection.subject.as_ref().and_then(|s| s.name_cn.clone()),
                         collection_type: collection.collection_type,
+                    }),
+                    3 => creates.push(CreatePlan {
+                        collection: collection.clone(),
+                        h_remote: h_remote.clone(),
+                        subject: None,
                     }),
                     // dropped（弃番）/ done（看过）且本地无条目：跳过（看过≠追番）。
                     _ => {}
@@ -6608,10 +6787,8 @@ mod bangumi_sync {
                 if plan.collection.subject.is_none() && plan.subject.is_none() {
                     continue; // 详情补拉失败且无内嵌概要：无法构造条目
                 }
-                if find_entry_index(&guard, plan.collection.subject_id).is_some()
-                    || tombstone_exists(&guard, plan.collection.subject_id)
-                {
-                    continue; // 复核：应用前条目已被创建/删除
+                if find_entry_index(&guard, plan.collection.subject_id).is_some() {
+                    continue; // 复核：应用前条目已被创建
                 }
                 let anime =
                     collection_subject_anime(&plan.collection, plan.subject.as_ref(), offline_map);
@@ -6634,6 +6811,11 @@ mod bangumi_sync {
                 entry["lastPushedPayloadHash"] = Value::Null;
                 entry["lastChangedBy"] = json!("bangumi");
                 entry["lastPulledFromBangumiAt"] = json!(now_seconds());
+                if plan.collection.collection_type == bangumi::SubjectCollectionType::Doing.as_u32() {
+                    if let Some(tombstones) = guard["syncMetadata"]["followingDeletedAt"].as_object_mut() {
+                        tombstones.remove(&plan.collection.subject_id.to_string());
+                    }
+                }
                 guard["following"]
                     .as_array_mut()
                     .expect("following array")
@@ -6698,6 +6880,27 @@ mod bangumi_sync {
     ) {
         let entry_id = value_i64(state["following"][entry_index].get("id"));
         if collection.collection_type == bangumi::SubjectCollectionType::Dropped.as_u32() {
+            // A locally-created/re-followed record must not be deleted by a stale
+            // Bangumi `dropped` snapshot.  Keep the local intent and let the write
+            // phase converge the remote collection back to Doing.  Without this
+            // guard a just-added subject disappears seconds after it is matched.
+            let local_intent = {
+                let intent_at = value_i64(
+                    state["following"][entry_index].get("localFollowIntentAt"),
+                );
+                let last_remote_at = value_i64(
+                    state["following"][entry_index].get("lastPulledFromBangumiAt"),
+                );
+                intent_at > 0
+                    && (intent_at / 1_000 > last_remote_at
+                        || intent_at > value_i64(
+                            state["syncMetadata"]["followingDeletedAt"]
+                                .get(&entry_id.to_string()),
+                        ))
+            };
+            if local_intent {
+                return;
+            }
             remove_following(state, entry_id);
             super::remove_pending_bangumi_unfollow(state, collection.subject_id);
             report.unfollowed += 1;
@@ -6774,6 +6977,9 @@ mod bangumi_sync {
         entry["lastChangedBy"] = json!("bangumi");
         entry["lastPulledFromBangumiAt"] = json!(now_seconds());
         entry["syncUpdatedAt"] = json!(now_millis());
+        if collection.collection_type == bangumi::SubjectCollectionType::Doing.as_u32() {
+            entry["localFollowIntentAt"] = Value::Null;
+        }
     }
 
     /// 收藏（内嵌 SlimSubject 优先，缺信息用补拉的 Subject 详情）→
@@ -11887,7 +12093,8 @@ mod tests {
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(22222, " wishing 甲")},
             {"subject_id": 33333, "subject_type": 2, "rate": null, "type": 4,
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(33333, "搁置 乙")},
-            // 本地无 + 墓碑：doing 不自动恢复，计入建议（本地删除优先）。
+            // 本地无 + 墓碑：doing 当前仍是远端在看，应恢复本地追番；
+            // 墓碑只代表旧的本地取消意图。
             {"subject_id": 44444, "subject_type": 2, "rate": null, "type": 3,
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(44444, "被删 丙")},
             // 本地无：doing → 创建 following（内嵌 SlimSubject）。
@@ -11945,7 +12152,7 @@ mod tests {
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.pulled, 7);
-        assert_eq!(report.followed, 1);
+        assert_eq!(report.followed, 2);
         assert_eq!(report.unfollowed, 1);
         assert_eq!(report.completed_tasks, 1);
         assert_eq!(report.conflicts, 0);
@@ -11955,7 +12162,7 @@ mod tests {
             .iter()
             .map(|suggestion| (suggestion.subject_id, suggestion.collection_type))
             .collect();
-        assert_eq!(rendered, vec![(22222, 1), (33333, 4), (44444, 3)]);
+        assert_eq!(rendered, vec![(22222, 1), (33333, 4)]);
         assert_eq!(suggestions[0].name_cn.as_deref(), Some(" wishing 甲"));
 
         let guard = state.lock().unwrap();
@@ -12018,8 +12225,9 @@ mod tests {
         assert_eq!(entry(22222).unwrap()["bangumiStatus"], "wish");
         assert!(entry(33333).is_some());
         assert_eq!(entry(33333).unwrap()["bangumiStatus"], "on_hold");
-        // 墓碑阻恢复：44444 不创建。
-        assert!(entry(44444).is_none());
+        // 远端 doing 会恢复本地追番，即使本地残留旧墓碑。
+        let revived = entry(44444).expect("44444 revived from remote doing");
+        assert_eq!(revived["bangumiStatus"], "doing");
         // doing 无墓碑 → 新建 following（复用 bangumi 构造 + 收藏字段）。
         let created = entry(55555).expect("55555 created");
         assert_eq!(created["source"], "bangumi");

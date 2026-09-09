@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AniLog",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "identifier": "io.anilog.desktop",
   "build": {
     "frontendDist": "../dist/tauri-standard",
@@ -48,7 +48,7 @@
       }
     },
     "android": {
-      "versionCode": 10,
+      "versionCode": 11,
       "debugApplicationIdSuffix": ".debug"
     }
   }

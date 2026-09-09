@@ -32,14 +32,14 @@ Local-first anime schedule, notification, episode task manager, optional Bangumi
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 正式版 v0.7.2
+### 正式版 v0.7.3
 
-- [`AniLog-Windows-v0.7.2-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.2/AniLog-Windows-v0.7.2-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.7.2-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.2/AniLog-Original-Windows-v0.7.2-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.7.2-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.2/AniLog-Android-v0.7.2-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
-- [`AniLog-Original-Android-v0.7.2-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.2/AniLog-Original-Android-v0.7.2-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
+- [`AniLog-Windows-v0.7.3-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Windows-v0.7.3-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.7.3-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Original-Windows-v0.7.3-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.7.3-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Android-v0.7.3-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.7.3-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Original-Android-v0.7.3-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-`v0.7.2` 已正式发布，进一步修复 Bangumi 分季作品的本地/全局集号混用、季度列表显示全局集号、旧观看任务残留，以及 Android 分季分钟级时间匹配。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
+`v0.7.3` 已正式发布，修复 Android 季度缓存重启后失效、过期缓存阻塞首屏，以及新番详情页在窄屏设备横向溢出的问题；同时包含 v0.7.2 的 Bangumi 分季集号、任务和分钟级时间修复。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
 
 - 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -83,7 +83,7 @@ npm run dev
 npm run dev:original
 ```
 
-`v0.7.2` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.7.3` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 

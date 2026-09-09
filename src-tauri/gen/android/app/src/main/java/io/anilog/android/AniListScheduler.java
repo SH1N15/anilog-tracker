@@ -141,6 +141,7 @@ final class AniListScheduler {
             JSONArray allTasks = MobileStore.allTasks(context);
             JSONArray keptTasks = new JSONArray();
             int anilistId = follow.optInt("anilistId", 0);
+            long followedAt = follow.optLong("followedAt", 0);
             for (int taskIndex = 0; taskIndex < allTasks.length(); taskIndex += 1) {
                 JSONObject task = allTasks.optJSONObject(taskIndex);
                 if (task == null) continue;
@@ -155,12 +156,25 @@ final class AniListScheduler {
                 int taskEpisode = task.optInt("episode", 0);
                 JSONObject matched = findEpisode(episodes, taskEpisode);
                 if (matched == null) {
+                    int maxKnownEpisode = 0;
+                    for (int episodeIndex = 0; episodeIndex < episodes.length(); episodeIndex += 1) {
+                        JSONObject knownEpisode = episodes.optJSONObject(episodeIndex);
+                        if (knownEpisode == null || knownEpisode.optInt("type", 0) != 0) continue;
+                        maxKnownEpisode = Math.max(maxKnownEpisode, episodeNumber(knownEpisode));
+                    }
+                    if ("pending".equals(task.optString("status", "pending"))
+                        && maxKnownEpisode > 0 && taskEpisode > maxKnownEpisode) {
+                        continue;
+                    }
                     task.put("needsScheduleReview", true);
                     task.put("scheduleReviewReason", "Bangumi episode airdate unavailable");
                     keptTasks.put(task);
                     continue;
                 }
                 String taskAirdate = matched.optString("airdate", "").trim();
+                if (followedAt > 0 && isBeforeFollow(taskAirdate, followedAt)) {
+                    continue;
+                }
                 if (!taskAirdate.isEmpty() && !isAired(taskAirdate, now)) {
                     continue;
                 }
@@ -199,7 +213,7 @@ final class AniListScheduler {
                     }
                 }
             }
-            if (nextEpisode > 0 && nextAt > 0) {
+                if (nextEpisode > 0 && nextAt > 0) {
                 MobileStore.updateSchedule(context, subjectId, nextEpisode, nextAt, null);
             } else {
                 MobileStore.updateSchedule(context, subjectId, null, null, null);
@@ -225,7 +239,7 @@ final class AniListScheduler {
             if (follow == null || !"bangumi".equals(follow.optString("source"))) continue;
             int subjectId = follow.optInt("id", 0);
             int anilistId = follow.optInt("anilistId", 0);
-            int expectedEpisode = follow.optInt("nextEpisode", 0);
+            int expectedEpisode = expectedLocalNextEpisode(context, follow, null);
             if (subjectId <= 0 || anilistId <= 0 || expectedEpisode <= 0) continue;
             JSONObject media = MobileStore.anilistScheduleCache(
                 context, anilistId, now, ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS);
@@ -318,6 +332,38 @@ final class AniListScheduler {
         return null;
     }
 
+    private static boolean isBeforeFollow(String value, long followedAt) {
+        if (value == null || value.trim().isEmpty() || followedAt <= 0) return false;
+        String trimmed = value.trim();
+        try {
+            if (trimmed.length() > 10 && (trimmed.contains("T") || trimmed.endsWith("Z"))) {
+                return parseAirdate(trimmed) < followedAt;
+            }
+            LocalDate airDate = LocalDate.parse(trimmed.substring(0, 10));
+            LocalDate followDate = Instant.ofEpochSecond(followedAt)
+                .atZone(ZoneOffset.UTC).toLocalDate();
+            return airDate.isBefore(followDate);
+        } catch (RuntimeException error) { return false; }
+    }
+
+    private static int expectedLocalNextEpisode(Context context, JSONObject follow, JSONArray supplied) {
+        int subjectId = follow.optInt("id", 0);
+        JSONArray episodes = supplied != null ? supplied : MobileStore.bangumiEpisodesCache(
+            context, subjectId, System.currentTimeMillis() / 1000L, -1, false);
+        if (episodes == null) return 0;
+        long now = System.currentTimeMillis() / 1000L;
+        int next = 0;
+        for (int index = 0; index < episodes.length(); index += 1) {
+            JSONObject episode = episodes.optJSONObject(index);
+            if (episode == null || episode.optInt("type", 0) != 0) continue;
+            int number = episodeNumber(episode);
+            String airdate = episode.optString("airdate", "").trim();
+            if (number > 0 && !airdate.isEmpty() && !isAired(airdate, now)
+                && (next == 0 || number < next)) next = number;
+        }
+        return next;
+    }
+
     /** Bangumi `ep` is the local season number; `sort` is global order. */
     private static int episodeNumber(JSONObject episode) {
         double ep = episode.optDouble("ep", Double.NaN);
@@ -361,7 +407,7 @@ final class AniListScheduler {
     ) {
         int subjectId = follow.optInt("id", 0);
         int anilistId = follow.optInt("anilistId", 0);
-        int expectedEpisode = follow.optInt("nextEpisode", 0);
+        int expectedEpisode = expectedLocalNextEpisode(context, follow, null);
         if (subjectId <= 0 || expectedEpisode <= 0) return 0;
         if (next == null || next.optLong("airingAt", 0) <= 0) {
             MobileStore.updateCover(context, subjectId, coverImage);

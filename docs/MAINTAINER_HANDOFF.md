@@ -2,7 +2,7 @@
 
 本文档面向后续维护者和 AI，记录项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
-> `v0.7.2` 已正式发布：在 `v0.7.1` 的 Bangumi 逐集播出权威基础上，修复分季作品 `ep`/`sort` 集号空间混用、AniList 全局集号污染季度卡片和观看任务、启动时旧任务未立即愈合，以及 Android 分季分钟级时间匹配问题。Standard 的逐集身份/`episodeId` 权威仍为 Bangumi `/v0/episodes`；AniList 只在确认同一集后提供分钟级时间。AniList 暂时 403 时不得用 `bangumi-data` 的周播锚点猜测后续集数；系统降级为最近一次可信 AniList 时间或日期级时间，恢复后自动纠偏。WebDAV 合并后必须用本地 Bangumi episode 缓存再愈合一次。
+> `v0.7.3` 已正式发布：在 `v0.7.2` 的 Bangumi 逐集播出权威基础上，修复 Android 季度缓存重启后失效、过期缓存阻塞首屏，以及窄屏详情页横向溢出。Standard 的逐集身份/`episodeId` 权威仍为 Bangumi `/v0/episodes`；AniList 只在确认同一集后提供分钟级时间。AniList 暂时 403 时不得用 `bangumi-data` 的周播锚点猜测后续集数；系统降级为最近一次可信 AniList 时间或日期级时间，恢复后自动纠偏。WebDAV 合并后必须用本地 Bangumi episode 缓存再愈合一次。
 
 ## 1. 项目现状
 
@@ -10,9 +10,9 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
-- 正式版：`v0.7.2`，GitHub Latest
-- 当前开发基线：`v0.7.2`
-- Android `versionCode`：`10`（仅 `arm64-v8a`）
+- 正式版：`v0.7.3`，GitHub Latest
+- 当前开发基线：`v0.7.3`
+- Android `versionCode`：`11`（仅 `arm64-v8a`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 
 Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。
@@ -116,7 +116,7 @@ Windows 启动后进行一次同步，本地变化会延迟合并，空闲时最
 | Windows debug | Tauri 应用数据目录 |
 | Android | 系统应用私有目录 |
 
-季度数据位于 `season-cache`。图片也由应用缓存管理，但缓存不参与 WebDAV。产品不设置硬性缓存上限，界面提供当前缓存大小和“清理缓存”。
+季度数据位于 `season-cache`。标准版 Bangumi 季度缓存保存在 `season-cache/bangumi-cache`：当前季度约 6 小时、历史季度 30 天；过期缓存先显示，网络刷新在后台完成。Android 备用 WebView 缓存使用压缩快照并限制条目数，避免 localStorage 配额导致重启后缓存丢失。图片也由应用缓存管理，但缓存不参与 WebDAV。界面提供当前缓存大小和“清理缓存”。
 
 Windows 会尝试迁移旧 Electron 状态和 WebDAV 非密码配置。Android 仅在新状态为空时迁移旧 Capacitor SharedPreferences。只存在旧 WebView localStorage 中的已完成任务无法直接迁移，这是当前已知限制。迁移逻辑必须可重复执行且不能覆盖已经存在的新状态。
 

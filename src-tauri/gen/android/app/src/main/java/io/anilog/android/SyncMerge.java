@@ -144,13 +144,38 @@ final class SyncMerge {
         }
         JSONArray following = new JSONArray();
         for (Long id : ids) {
-            JSONObject winner = chooseRecord(
-                localFollowing.get(id), remoteFollowing.get(id), "followedAt");
+            JSONObject localCandidate = localFollowing.get(id);
+            long localCandidateIntent = localCandidate == null
+                ? 0 : localCandidate.optLong("localFollowIntentAt", 0);
+            long localCandidateRemoteAt = localCandidate == null
+                ? 0 : localCandidate.optLong("lastPulledFromBangumiAt", 0);
+            long tombstoneAt = deleted.containsKey(String.valueOf(id))
+                ? deleted.get(String.valueOf(id)) : 0L;
+            boolean localRefollow = localCandidate != null
+                && localCandidateIntent > 0
+                && (localCandidateIntent > tombstoneAt
+                    || localCandidateRemoteAt <= 0
+                    || localCandidateIntent > localCandidateRemoteAt * 1000L);
+            JSONObject winner = localRefollow
+                ? localCandidate
+                : chooseRecord(localCandidate, remoteFollowing.get(id), "followedAt");
             if (winner == null) continue;
             long timestamp = recordTimestamp(winner, "followedAt");
             Long tombstone = deleted.get(String.valueOf(id));
             if (tombstone == null) tombstone = 0L;
-            if (timestamp > tombstone) following.put(winner);
+            long localIntentAt = winner.optLong("localFollowIntentAt", 0);
+            long remotePulledAt = winner.optLong("lastPulledFromBangumiAt", 0);
+            if (localIntentAt > 0
+                && (localIntentAt > tombstone
+                    || remotePulledAt <= 0
+                    || localIntentAt > remotePulledAt * 1000L)) {
+                // A local re-follow is an explicit fresh intent.  Ignore and
+                // clear stale WebDAV tombstones so Android converges with Rust.
+                deleted.remove(String.valueOf(id));
+                following.put(winner);
+            } else if (timestamp > tombstone) {
+                following.put(winner);
+            }
         }
         following = sortByFollowingId(following);
 
