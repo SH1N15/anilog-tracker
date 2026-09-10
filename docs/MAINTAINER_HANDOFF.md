@@ -116,7 +116,7 @@ Windows 启动后进行一次同步，本地变化会延迟合并，空闲时最
 | Windows debug | Tauri 应用数据目录 |
 | Android | 系统应用私有目录 |
 
-季度数据位于 `season-cache`。标准版 Bangumi 季度缓存保存在 `season-cache/bangumi-cache`：当前季度约 6 小时、历史季度 30 天；过期缓存先显示，网络刷新在后台完成。Android 备用 WebView 缓存使用压缩快照并限制条目数，避免 localStorage 配额导致重启后缓存丢失。图片也由应用缓存管理，但缓存不参与 WebDAV。界面提供当前缓存大小和“清理缓存”。
+季度数据位于 `season-cache`。正式 Tauri Standard 的 Bangumi 季度缓存保存在 `season-cache/bangumi-cache`，TTL 为 24 小时；即使过期也先显示可信快照，网络刷新在后台完成。旧浏览器/Capacitor 备用链的活跃季度 TTL 为 6 小时、历史季度为 30 天，并使用压缩快照和条目数限制，避免 Android WebView localStorage 配额导致重启后缓存丢失。不要把两条缓存链混为一谈。图片也由应用缓存管理，但缓存不参与 WebDAV。界面提供当前缓存大小和“清理缓存”。
 
 Windows 会尝试迁移旧 Electron 状态和 WebDAV 非密码配置。Android 仅在新状态为空时迁移旧 Capacitor SharedPreferences。只存在旧 WebView localStorage 中的已完成任务无法直接迁移，这是当前已知限制。迁移逻辑必须可重复执行且不能覆盖已经存在的新状态。
 
@@ -131,11 +131,16 @@ Windows 会尝试迁移旧 Electron 状态和 WebDAV 非密码配置。Android �
 - Android SDK 36
 - Android NDK `27.2.12479018`
 
-本机当前曾验证的路径如下，仅供排障，绝不能写入构建脚本或提交本机配置：
+维护者本机曾验证的路径如下，仅供排障；其他机器应使用自己的安装路径，不要硬编码：
 
 - Android SDK：`D:\Android\SDK`
 - Android Studio/AVD 数据：`D:\Android\ASData`
-- JDK：`C:\Program Files\Java\jdk-17`
+- Android Studio JBR 21：`D:\Program Files\Android\Android Studio\jbr`
+- 系统默认 `JAVA_HOME` 曾指向 `C:\Program Files\Java\jdk-17`，但 v0.7.3 正式 Android 构建实际使用上述 JBR 21
+- Gradle wrapper：`src-tauri/gen/android/gradlew.bat`，版本 `8.14.3`
+- Android NDK：`D:\Android\SDK\ndk\27.2.12479018`
+
+v0.7.3 构建机实测版本为 Node.js `24.18.0`、npm `11.16.0`、Rust/Cargo `1.97.1`、OpenJDK `21.0.10`、GitHub CLI `2.96.0`。项目最低要求仍以锁文件、CI 和上方通用要求为准，不要把这组实测版本误当成唯一可用版本。
 
 项目曾清理 `node_modules` 和 Rust/Android 大型构建输出以释放空间。因此新会话开始开发前通常需要：
 
@@ -176,6 +181,43 @@ npm run tauri:android:build:original
 
 两条正式构建命令都固定使用 `--target aarch64`；发布 APK 必须只包含 `arm64-v8a`。
 
+### 9.1 v0.7.3 实际构建顺序
+
+Windows Standard 与 Original 共用 bundle 输出目录，Android 两个 edition 也共用 APK 输出路径，因此必须串行构建并在每一步结束后立即复制改名：
+
+1. `npm ci`（依赖已存在且 lockfile 未变时可跳过）。
+2. 运行 Standard/Original 两套 Rust 测试和 Node 回归门禁。
+3. `npm run tauri:build`，立即复制 `src-tauri/target/release/bundle/nsis/AniLog_<版本>_x64-setup.exe`。
+4. `npm run tauri:build:original`，立即复制 `src-tauri/target/release/bundle/nsis/AniLog Original_<版本>_x64-setup.exe`。
+5. 在当前 PowerShell 会话设置 `$env:JAVA_HOME` 为兼容的 JDK/JBR 21。
+6. `npm run tauri:android:build`，立即复制 `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk`。
+7. `npm run tauri:android:build:original`，再次从同一输出位置复制 Original APK。
+8. 对两个 APK 分别执行 `zipalign -P 16`，再用同一正式密钥执行 `apksigner sign`。
+9. 使用 `apksigner verify --verbose --print-certs`、`aapt dump badging`、`zipalign -c -P 16 -v 4` 和 ZIP 文件清单验证签名、包名、版本、对齐和 ABI。
+10. 计算四件套 SHA-256，写入 `release-notes/vX.Y.Z.md`，再提交、打标签和创建正式 Release。
+
+虽然 Tauri 产物路径中写着 `universal`，只要构建命令带 `--target aarch64`，最终包可以且应该只有 `lib/arm64-v8a/libanilog_lib.so`；是否为单 ABI 必须看 APK 内容，不能根据目录名判断。
+
+### 9.2 版本源与构建产物
+
+发布前需要同步更新：
+
+- `package.json`、`package-lock.json`：前端/npm 版本。
+- `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`：Rust crate 版本。
+- `src-tauri/tauri.conf.json`：Tauri 版本与 Android `versionCode`。
+- `README.md`、`docs/MAINTAINER_HANDOFF.md`、`release-notes/vX.Y.Z.md`：下载链接、当前版本和校验值。
+
+主要输出位置：
+
+| 产物 | 实际输出路径 |
+| --- | --- |
+| Windows Standard | `src-tauri/target/release/bundle/nsis/AniLog_<版本>_x64-setup.exe` |
+| Windows Original | `src-tauri/target/release/bundle/nsis/AniLog Original_<版本>_x64-setup.exe` |
+| Android unsigned APK | `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk` |
+| Android Rust `.so` | `src-tauri/target/aarch64-linux-android/release/libanilog_lib.so` |
+
+仓库根目录的 `android/` 是旧 Capacitor 回退工程。对它执行 `gradlew assembleStandardRelease` 得到的不是当前 Tauri 正式版；当前正式 Android 工程是 `src-tauri/gen/android/`。
+
 修改共享状态、同步、通知、任务或桥接时，两套 edition 的 Rust 测试和两个目标平台都需要验证。只改文档时运行 `git diff --check` 和 Markdown 链接检查即可。更完整的命令见 [`../CONTRIBUTING.md`](../CONTRIBUTING.md) 与 [`TAURI_MIGRATION.md`](TAURI_MIGRATION.md)。
 
 ## 10. CI
@@ -206,6 +248,11 @@ CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支
 ## 12. 已知风险与后续事项
 
 - Tauri 已成为正式架构，仍需继续收集 Windows/Android 反馈。
+- AniList 是分钟级播出时间的唯一可靠来源；`bangumi-data` 记录的是首播/流媒体锚点，不足以推断临时改档、停播或后续每集的分钟。AniList 返回 403/429/5xx 时只能保留最近一次可信时间或退回日期级信息，禁止按周播锚点“补推”下一集。
+- 现有状态文件可能来自 v0.7.0 以前的旧键、WebDAV 删除墓碑或旧版错误任务。排障时先备份 `<安装目录>\data`，再记录 `anilog-state.json`、`season-cache` 和同步文件的时间戳；不要直接删除坚果云远端文件来“解决”本地显示问题。
+- 追番列表的 `nextAiringEpisode` 是派生缓存，不属于 WebDAV 同步字段。若出现“加入后短暂有时间、随后消失”，优先检查权威刷新失败、旧删除墓碑合并和本地/远端 `subjectId` 是否重复，而不是把缓存字段重新写入同步文档。
+- 季度首屏慢通常来自缓存未命中、过期刷新仍在进行或旧 WebView localStorage 配额迁移；Tauri 主链必须先显示可信快照再后台刷新，不能恢复成首屏等待全量 Bangumi 分页。
+- Android 详情页只应在窄屏上换行和纵向排列；不要用固定宽度卡片或横向滚动掩盖布局问题。后台同步的执行时间受 WorkManager、AlarmManager 和厂商省电策略影响，不能承诺精确到分钟。
 - 旧架构仍占用仓库空间，但当前有明确回退价值，不应仅为减小目录而删除。
 - Rust 与 Android AniList User-Agent 从各自构建版本生成，发布时需确认版本源同步更新。
 - `src/api.ts` 旧浏览器路径的 Bangumi resolver version 为 4，Rust 实现为 5。它们是不同实现，未经迁移分析不能强制改成相同数字。

@@ -4,10 +4,11 @@
 
 ## 当前状态
 
-- 当前正式版：`v0.7.2`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
+- 当前正式版：`v0.7.3`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
+- 当前维护主工作区是 `D:\AniList`；不要在 `C:\Users\Yang\.codex\worktrees` 下继续开发。若 Codex 自动创建了临时 worktree，先确认它是否为空/过时，再回到 `D:\AniList`。
 
 ## 强约束
 
@@ -25,12 +26,14 @@
 ## 修改与验证
 
 - 依赖曾为释放磁盘空间而清理；首次构建先执行 `npm ci`。
+- Android 正式构建必须使用 Android Studio JBR 21（本机路径见维护交接文档）；JDK 17 会出现 Java 21 源版本错误，JDK 25 会在 Gradle/AGP 最后阶段失败。
 - 标准版 Rust：`cargo test --manifest-path src-tauri/Cargo.toml --features standard`。
 - Original Rust：`cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features original`。
 - Windows 开发：`npm run tauri:dev` / `npm run tauri:dev:original`。
 - Windows 构建：`npm run tauri:build` / `npm run tauri:build:original`。
 - 改共享状态、任务、同步、通知或跨平台桥接时，必须验证两个 edition 和 Windows/Android 两端。
 - 只改文档时检查 Markdown 链接和 `git diff --check`，无需恢复依赖或重新打包。
+- Android Standard/Original 共享 APK 输出目录，必须串行构建并立即复制改名；不能把后一次构建覆盖的 APK 当成前一个 edition。
 - 发布前阅读 [`docs/MAINTAINER_HANDOFF.md`](docs/MAINTAINER_HANDOFF.md) 和 [`docs/RELEASING.md`](docs/RELEASING.md)，并确认使用的是 Tauri 正式流程还是 v0.5 回退流程。
 
 ## 安全边界
