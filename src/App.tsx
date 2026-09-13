@@ -781,7 +781,7 @@ const AnimeCard = memo(function AnimeCard({
         <p className="anime-subtitle">{originalTitle !== displayTitle ? originalTitle : secondaryTitle(anime.title, language) || anime.studios?.nodes[0]?.name || t('制作信息待定', 'Studio TBA')}</p>
         <div className="airing-line">
           <Clock3 size={15} />
-          <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language)}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language)}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : t('更新时间待定', 'Schedule TBA')}</span>
+          <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : t('更新时间待定', 'Schedule TBA')}</span>
         </div>
         <button className={`follow-button ${followed ? 'followed' : ''}`} disabled={followBusy} onClick={() => onToggle(anime)}>
           {followed ? <Check size={17} /> : <Bell size={17} />}
@@ -918,7 +918,7 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
             {anime.nextAiringEpisode && (
               <div className="next-airing">
                 <Clock3 size={19} />
-                <div><strong>{t(`第 ${anime.nextAiringEpisode.episode} 集`, `Episode ${anime.nextAiringEpisode.episode}`)}</strong><span>{formatAiring(anime.nextAiringEpisode.airingAt, true, language)} · {relativeTime(anime.nextAiringEpisode.airingAt, language)}</span></div>
+                <div><strong>{t(`第 ${anime.nextAiringEpisode.episode} 集`, `Episode ${anime.nextAiringEpisode.episode}`)}</strong><span>{formatAiring(anime.nextAiringEpisode.airingAt, true, language, anime.nextAiringEpisode.airingPrecision)} · {relativeTime(anime.nextAiringEpisode.airingAt, language, anime.nextAiringEpisode.airingPrecision)}</span></div>
               </div>
             )}
             <div className="detail-actions">
@@ -980,7 +980,7 @@ function TaskRow({ task, language, onToggle }: { task: WatchTask; language: UiLa
       </button>
       {task.coverImage ? <img src={task.coverImage} alt="" /> : <span className="cover-placeholder" />}
       <div className="task-copy"><strong>{task.animeTitle}</strong><span>{t(`第 ${task.episode} 集`, `Episode ${task.episode}`)}</span></div>
-      <div className="task-time"><Clock3 size={15} /><span>{formatAiring(task.airingAt, true, language)}</span></div>
+      <div className="task-time"><Clock3 size={15} /><span>{formatAiring(task.airingAt, true, language, task.airingPrecision)}</span></div>
       <span className="task-state">{task.status === 'completed' ? t('已看完', 'Completed') : t('待观看', 'To watch')}</span>
     </article>
   );
@@ -1175,8 +1175,8 @@ function FollowingView({
         )}
         <small>{titleOf(item.title, language) !== item.displayTitle ? `${titleOf(item.title, language)} · ` : ''}{item.episodes ? t(`全 ${item.episodes} 集`, `${item.episodes} episodes`) : t('总集数待定', 'Episode count TBA')}</small>
         {bangumiSubjectId != null && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4, fontSize: 12 }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <div className="following-controls">
+            <label>
               <select
                 className="entry-select status-select"
                 value={item.bangumiStatus || 'doing'}
@@ -1187,7 +1187,7 @@ function FollowingView({
                 {BANGUMI_STATUS_OPTIONS.map((option) => <option key={option.value} value={option.value}>{t(...option.label)}</option>)}
               </select>
             </label>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <label>
               <Star size={13} />
               <select
                 className="entry-select rating-select"
@@ -1201,7 +1201,7 @@ function FollowingView({
               </select>
             </label>
             {item.watchedEpisode != null && (
-              <span style={{ opacity: 0.7 }}>
+              <span className="following-progress">
                 {t(`进度 ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`, `Progress ${item.watchedEpisode}${item.episodes ? ` / ${item.episodes}` : ''}`)}
               </span>
             )}
@@ -1211,7 +1211,7 @@ function FollowingView({
       <div className="following-next">
         <small>{t('下次更新', 'Next episode')}</small>
         <strong>{item.nextAiringEpisode ? t(`第 ${item.nextAiringEpisode.episode} 集`, `Episode ${item.nextAiringEpisode.episode}`) : t('暂无日程', 'No schedule')}</strong>
-        <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language)} · ${relativeTime(item.nextAiringEpisode.airingAt, language)}` : item.source === 'bangumi' ? t('等待 Bangumi 日程', 'Waiting for Bangumi') : t('等待 AniList 公布', 'Waiting for AniList')}</span>
+        <span>{item.nextAiringEpisode ? `${formatAiring(item.nextAiringEpisode.airingAt, true, language, item.nextAiringEpisode.airingPrecision)} · ${relativeTime(item.nextAiringEpisode.airingAt, language, item.nextAiringEpisode.airingPrecision)}` : item.source === 'bangumi' ? t('等待 Bangumi 日程', 'Waiting for Bangumi') : t('等待 AniList 公布', 'Waiting for AniList')}</span>
       </div>
       <button className="icon-button danger" title={t('取消追番', 'Unfollow')} aria-label={t(`取消追番 ${item.displayTitle}`, `Unfollow ${item.displayTitle}`)} onClick={() => onUnfollow(item.id)}><Minus size={19} /></button>
     </article>

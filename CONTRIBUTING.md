@@ -8,8 +8,9 @@
 
 - Node.js 22
 - npm
+- Rust 1.85+
 - Windows 10/11（运行和打包桌面版）
-- JDK 17 或 21、Android SDK/compile target 36（构建 Tauri Android 版；暂不支持 JDK 25）
+- JBR/JDK 21、Android SDK/compile target 36、NDK `27.2.12479018`（当前 Tauri Android 正式构建链）
 
 旧 Capacitor 回退工程的 `android/app/build.gradle` 使用 Build Tools 36.1.0；这不是 Tauri 的 SDK 版本要求。
 
@@ -31,22 +32,22 @@ node node_modules\electron\install.js
 Windows 标准版：
 
 ```powershell
-npm run dev
+npm run tauri:dev
 ```
 
 Windows 原名版：
 
 ```powershell
-npm run dev:original
+npm run tauri:dev:original
 ```
 
 原名版的中英文文案集中使用 `src/i18n.ts` 的语言工具。新增用户可见文本时，应同时提供中文和英文，并验证标准版仍固定使用中文。
 
-浏览器预览地址通常为 `http://127.0.0.1:5173/`。浏览器模式仅用于界面预览；系统托盘、开机自启和 Windows 通知只在 Electron 或 Tauri 原生外壳中生效。
+仅做浏览器预览时运行 `npm run dev:tauri:web` 或 `npm run dev:tauri-original:web`，地址通常为 `http://127.0.0.1:5173/`。浏览器不能验证托盘、原生通知或 Android 后台。旧 `npm run dev` / `dev:original` 启动的是 Electron 回退实现。
 
 ## Tauri 2 开发
 
-Tauri 2 是 v0.6 测试版及后续版本的主要开发方向。运行两个桌面变体：
+Tauri 2 是当前 `v0.7.4` 的正式架构。运行两个桌面变体：
 
 ```powershell
 npm run tauri:dev
@@ -129,12 +130,23 @@ npm run test:webdav-sync
 npm run test:webdav-service
 npm run test:cache-storage
 npm run test:season-cache
+npm run test:season-grouping
 npm run test:data
 npm run test:bangumi
 npm audit --omit=dev --audit-level=high
 ```
 
-`build:all`、`build:android`、`build:android-original` 和 `dist:all` 属于 v0.5 Electron/Capacitor 回退验证；需要维护回退工程时再单独运行，不作为 Tauri v0.6.0 的主测试清单。
+`build:all`、`build:android`、`build:android-original` 和 `dist:all` 属于 v0.5 Electron/Capacitor 回退验证；不作为 Tauri 正式版主测试清单的替代。
+
+修改 Android 桥接、任务或播出逻辑时，在兼容 JBR 21 会话中分别设置
+`ANILOG_ANDROID_EDITION=standard` 和 `original`，串行运行：
+
+```powershell
+.\src-tauri\gen\android\gradlew.bat -p src-tauri/gen/android :app:testUniversalDebugUnitTest --console=plain
+```
+
+任务保留、时间精度、前后台快照和进度回归契约见
+[docs/WATCH_STATE_REGRESSIONS.md](docs/WATCH_STATE_REGRESSIONS.md)。测试不得读取或修改真实 WebDAV 账户与安装目录状态。
 
 修改共享状态、同步逻辑或跨平台接口时，应同时验证 Windows 与 Android 构建。只修改文档时无需重新打包安装程序，但应检查 Markdown 链接和命令是否正确。
 

@@ -40,6 +40,10 @@ import java.util.TreeSet;
 final class SyncMerge {
     static final int SYNC_VERSION = 1;
     static final long MAX_DOCUMENT_BYTES = 5L * 1024L * 1024L;
+    static final String[] LOCAL_SCHEDULE_KEYS = {
+        "nextAiringEpisode", "nextEpisode", "nextAiringAt", "nextEpisodeId",
+        "nextAiringPrecision", "scheduleUpdatedAt", "episodeSchedule"
+    };
 
     private SyncMerge() {}
 
@@ -86,7 +90,11 @@ final class SyncMerge {
         if (rawFollowing != null) {
             for (int index = 0; index < rawFollowing.length(); index += 1) {
                 JSONObject item = rawFollowing.optJSONObject(index);
-                if (item != null && item.optLong("id", 0) > 0) following.put(item);
+                if (item != null && item.optLong("id", 0) > 0) {
+                    JSONObject copy = new JSONObject(item.toString());
+                    for (String key : LOCAL_SCHEDULE_KEYS) copy.remove(key);
+                    following.put(copy);
+                }
             }
         }
         following = sortByFollowingId(following);
@@ -104,7 +112,7 @@ final class SyncMerge {
                 if (task.optLong("episode", 0) <= 0) continue;
                 String status = task.optString("status", "pending");
                 if (!"pending".equals(status) && !"completed".equals(status)) continue;
-                tasks.put(task);
+                tasks.put(new JSONObject(task.toString()));
             }
         }
         tasks = sortByTaskId(tasks);
@@ -244,6 +252,12 @@ final class SyncMerge {
         if (left == null && right == null) return null;
         if (left == null) return right;
         if (right == null) return left;
+        if ("createdAt".equals(fallback)) {
+            if ("pending".equals(left.optString("status")) && "airing".equals(left.optString("statusSource"))
+                && "completed".equals(right.optString("status"))) return right;
+            if ("pending".equals(right.optString("status")) && "airing".equals(right.optString("statusSource"))
+                && "completed".equals(left.optString("status"))) return left;
+        }
         long leftTime = recordTimestamp(left, fallback);
         long rightTime = recordTimestamp(right, fallback);
         if (leftTime != rightTime) return leftTime > rightTime ? left : right;
@@ -267,6 +281,18 @@ final class SyncMerge {
     /** 比较同步业务字段；updatedAt 等派生字段不参与。 */
     static boolean sameBusinessDocument(JSONObject left, JSONObject right) throws MergeException, org.json.JSONException {
         return businessKey(normalizeDocument(left)).equals(businessKey(normalizeDocument(right)));
+    }
+
+    static void restoreLocalSchedules(JSONArray following, JSONArray local) throws org.json.JSONException {
+        Map<Long, JSONObject> snapshots = indexFollowing(local);
+        for (int index = 0; index < following.length(); index++) {
+            JSONObject item = following.getJSONObject(index);
+            JSONObject snapshot = snapshots.get(item.optLong("id"));
+            if (snapshot == null) continue;
+            for (String key : LOCAL_SCHEDULE_KEYS) {
+                if (snapshot.has(key)) item.put(key, snapshot.opt(key));
+            }
+        }
     }
 
     private static String canonical(Object value) {

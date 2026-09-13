@@ -75,8 +75,12 @@ export function localAiringWeekday(anime: Anime, now = Math.floor(Date.now() / 1
   return day === 0 ? 6 : day - 1;
 }
 
-export function formatAiring(timestamp?: number | null, includeDate = true, language: UiLanguage = 'zh-CN'): string {
+export function formatAiring(timestamp?: number | null, includeDate = true, language: UiLanguage = 'zh-CN', precision?: string): string {
   if (!timestamp) return tr(language, '播出时间待定', 'Airing time TBA');
+  if (precision === 'date' || precision === 'unknown') {
+    return new Intl.DateTimeFormat(language, { month: 'numeric', day: 'numeric', weekday: 'short', timeZone: 'UTC' })
+      .format(new Date(timestamp * 1000));
+  }
   return new Intl.DateTimeFormat(language, {
     ...(includeDate ? { month: 'numeric', day: 'numeric', weekday: 'short' } : {}),
     hour: '2-digit',
@@ -85,8 +89,9 @@ export function formatAiring(timestamp?: number | null, includeDate = true, lang
   }).format(new Date(timestamp * 1000));
 }
 
-export function relativeTime(timestamp?: number | null, language: UiLanguage = 'zh-CN'): string {
+export function relativeTime(timestamp?: number | null, language: UiLanguage = 'zh-CN', precision?: string): string {
   if (!timestamp) return tr(language, '尚未公布', 'Not announced');
+  if (precision === 'date' || precision === 'unknown') return tr(language, '时刻待定', 'Time TBA');
   const seconds = timestamp - Math.floor(Date.now() / 1000);
   if (seconds <= 0) return tr(language, '已播出', 'Aired');
   const days = Math.floor(seconds / 86400);

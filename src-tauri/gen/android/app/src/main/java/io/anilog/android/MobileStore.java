@@ -55,16 +55,39 @@ final class MobileStore {
         Context context,
         JSONArray following,
         JSONArray pendingTasks,
+        JSONObject tombstones,
         boolean notificationsEnabled,
         boolean createTasksEnabled,
         boolean dailyTaskReminderEnabled,
         String dailyTaskReminderTime,
         String uiLanguage
-    ) {
+    ) throws JSONException, SyncMerge.MergeException {
         synchronized (LOCK) {
+            JSONArray localFollowing = following(context);
+            JSONObject incoming = SyncMerge.emptyDocument()
+                .put("following", following).put("tasks", pendingTasks)
+                .put("followingDeletedAt", tombstones);
+            SyncMerge.Result result = SyncMerge.merge(BackgroundSyncWorker.localDocument(context), incoming);
+            JSONArray mergedFollowing = result.merged.getJSONArray("following");
+            // Business LWW must not overwrite newer native schedules on resume.
+            SyncMerge.restoreLocalSchedules(mergedFollowing, following);
+            for (int index = 0; index < mergedFollowing.length(); index++) {
+                JSONObject item = mergedFollowing.getJSONObject(index);
+                for (int old = 0; old < localFollowing.length(); old++) {
+                    JSONObject previous = localFollowing.getJSONObject(old);
+                    if (previous.optInt("id") == item.optInt("id")
+                        && previous.optLong("scheduleUpdatedAt") > 0
+                        && previous.optLong("scheduleUpdatedAt") >= item.optLong("scheduleUpdatedAt")) {
+                        for (String key : SyncMerge.LOCAL_SCHEDULE_KEYS) {
+                            if (previous.has(key)) item.put(key, previous.opt(key));
+                        }
+                    }
+                }
+            }
             prefs(context).edit()
-                .putString(FOLLOWING, following.toString())
-                .putString(PENDING_TASKS, pendingTasks.toString())
+                .putString(FOLLOWING, mergedFollowing.toString())
+                .putString(PENDING_TASKS, result.merged.getJSONArray("tasks").toString())
+                .putString(TOMBSTONES, result.merged.getJSONObject("followingDeletedAt").toString())
                 .putBoolean(NOTIFICATIONS, notificationsEnabled)
                 .putBoolean(CREATE_TASKS, createTasksEnabled)
                 .putBoolean(DAILY_TASK_REMINDER, dailyTaskReminderEnabled)
@@ -126,6 +149,8 @@ final class MobileStore {
                         item.put("nextEpisode", episode);
                         item.put("nextAiringAt", airingAt);
                     }
+                    item.put("nextAiringPrecision", "instant");
+                    item.put("scheduleUpdatedAt", System.currentTimeMillis());
                     if (coverImage != null && !coverImage.isEmpty()) item.put("coverImage", coverImage);
                 } catch (JSONException ignored) {}
                 break;
@@ -211,10 +236,11 @@ final class MobileStore {
             String id = event.optString("id");
             if (id.isEmpty()) return false;
             JSONArray delivered = readArray(context, DELIVERED);
+            boolean alreadyDelivered = false;
             for (int index = 0; index < delivered.length(); index += 1) {
-                if (id.equals(delivered.optString(index))) return false;
+                if (id.equals(delivered.optString(index))) alreadyDelivered = true;
             }
-            delivered.put(id);
+            if (!alreadyDelivered) delivered.put(id);
             JSONArray trimmed = new JSONArray();
             int start = Math.max(0, delivered.length() - 500);
             for (int index = start; index < delivered.length(); index += 1) trimmed.put(delivered.opt(index));
@@ -222,7 +248,7 @@ final class MobileStore {
             SharedPreferences.Editor editor = prefs(context).edit().putString(DELIVERED, trimmed.toString());
             if (storeEvent) {
                 JSONArray events = readArray(context, EVENTS);
-                events.put(event);
+                if (!alreadyDelivered) events.put(event);
                 editor.putString(EVENTS, events.toString());
 
                 JSONArray pendingTasks = readArray(context, PENDING_TASKS);
@@ -231,6 +257,7 @@ final class MobileStore {
                     JSONObject pendingTask = pendingTasks.optJSONObject(index);
                     if (pendingTask != null && id.equals(pendingTask.optString("id"))) {
                         taskKnown = true;
+                        if ("completed".equals(pendingTask.optString("status"))) alreadyDelivered = true;
                         break;
                     }
                 }
@@ -238,7 +265,7 @@ final class MobileStore {
                 editor.putString(PENDING_TASKS, pendingTasks.toString());
             }
             editor.apply();
-            return true;
+            return !alreadyDelivered;
         }
     }
 
@@ -269,7 +296,67 @@ final class MobileStore {
     /** 直接替换 following 列表（仅后台 Worker 的坚果云合并写回使用；前台由 Rust configure 驱动）。 */
     static void setFollowing(Context context, JSONArray following) {
         synchronized (LOCK) {
-            prefs(context).edit().putString(FOLLOWING, following == null ? "[]" : following.toString()).apply();
+            JSONArray stored = following;
+            if (following != null) {
+                try {
+                    stored = new JSONArray(following.toString());
+                    SyncMerge.restoreLocalSchedules(stored, readArray(context, FOLLOWING));
+                }
+                catch (JSONException ignored) {}
+            }
+            prefs(context).edit().putString(FOLLOWING, stored == null ? "[]" : stored.toString()).apply();
+        }
+    }
+
+    static void applyEpisodeSchedule(Context context, int subjectId, JSONArray episodes, JSONObject media) throws JSONException {
+        synchronized (LOCK) {
+            JSONArray following = readArray(context, FOLLOWING);
+            for (int index = 0; index < following.length(); index++) {
+                JSONObject follow = following.getJSONObject(index);
+                if (follow.optInt("id") != subjectId) continue;
+                long now = System.currentTimeMillis() / 1000L;
+                JSONArray rows = EpisodeSchedule.resolve(follow, episodes, media, now);
+                if (rows.length() == 0) return; // Missing data is not a cancellation.
+                JSONArray tasks = EpisodeSchedule.reconcileTasks(
+                    follow, readArray(context, PENDING_TASKS), rows, createTasksEnabled(context), now);
+                EpisodeSchedule.updateNext(follow, rows, now);
+                follow.put("scheduleUpdatedAt", System.currentTimeMillis());
+                JSONArray delivered = readArray(context, DELIVERED);
+                JSONArray retained = new JSONArray();
+                for (int delivery = 0; delivery < delivered.length(); delivery++) {
+                    String id = delivered.optString(delivery);
+                    boolean invalid = false;
+                    for (int rowIndex = 0; rowIndex < rows.length(); rowIndex++) {
+                        JSONObject row = rows.getJSONObject(rowIndex);
+                        if (id.equals(subjectId + "-" + row.optInt("episode")) && EpisodeSchedule.future(row, now)) invalid = true;
+                    }
+                    if (!invalid) retained.put(id);
+                }
+                prefs(context).edit().putString(FOLLOWING, following.toString())
+                    .putString(PENDING_TASKS, tasks.toString()).putString(DELIVERED, retained.toString()).apply();
+                return;
+            }
+        }
+    }
+
+    static void advanceAiredSchedule(Context context, int subjectId) {
+        synchronized (LOCK) {
+            JSONArray following = readArray(context, FOLLOWING);
+            for (int index = 0; index < following.length(); index++) {
+                JSONObject follow = following.optJSONObject(index);
+                if (follow == null || follow.optInt("id") != subjectId) continue;
+                JSONArray rows = follow.optJSONArray("episodeSchedule");
+                if (rows == null) {
+                    updateSchedule(context, subjectId, null, null, null);
+                } else {
+                    try {
+                        EpisodeSchedule.updateNext(follow, rows, System.currentTimeMillis() / 1000L);
+                        follow.put("scheduleUpdatedAt", System.currentTimeMillis());
+                        prefs(context).edit().putString(FOLLOWING, following.toString()).apply();
+                    } catch (JSONException ignored) {}
+                }
+                return;
+            }
         }
     }
 
@@ -277,6 +364,16 @@ final class MobileStore {
     static void setTasks(Context context, JSONArray tasks) {
         synchronized (LOCK) {
             prefs(context).edit().putString(PENDING_TASKS, tasks == null ? "[]" : tasks.toString()).apply();
+        }
+    }
+
+    static SyncMerge.Result mergeDocument(Context context, JSONObject remote) throws JSONException, SyncMerge.MergeException {
+        synchronized (LOCK) {
+            SyncMerge.Result result = SyncMerge.merge(BackgroundSyncWorker.localDocument(context), remote);
+            setFollowing(context, result.merged.getJSONArray("following"));
+            setTasks(context, result.merged.getJSONArray("tasks"));
+            setTombstones(context, result.merged.getJSONObject("followingDeletedAt"));
+            return result;
         }
     }
 
@@ -387,7 +484,7 @@ final class MobileStore {
             long fetchedAt = envelope.optLong("fetchedAt", 0);
             JSONObject media = envelope.optJSONObject("media");
             if (fetchedAt <= 0 || media == null || nowSeconds - fetchedAt > maxAgeSeconds) return null;
-            return new JSONObject(media.toString());
+            return new JSONObject(media.toString()).put("_fetchedAt", fetchedAt);
         } catch (JSONException ignored) {
             return null;
         }

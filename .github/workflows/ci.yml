@@ -55,6 +55,9 @@ jobs:
       - name: Test unfollow task retention
         run: npm run test:task-retention
 
+      - name: Test daily task reminders
+        run: npm run test:daily-task-reminder
+
       - name: Test window lifecycle
         run: npm run test:window-lifecycle
 
@@ -68,6 +71,9 @@ jobs:
 
       - name: Test season cache
         run: npm run test:season-cache
+
+      - name: Test season grouping and date precision
+        run: npm run test:season-grouping
 
       - name: Test data migration
         run: npm run test:data

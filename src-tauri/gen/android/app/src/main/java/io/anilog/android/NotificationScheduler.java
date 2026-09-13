@@ -48,7 +48,28 @@ final class NotificationScheduler {
         JSONArray following = MobileStore.following(context);
         for (int index = 0; index < following.length(); index += 1) {
             JSONObject item = following.optJSONObject(index);
-            if (item != null) schedule(context, item);
+            if (item != null) {
+                catchUpVerifiedEpisodes(context, item);
+                JSONObject current = MobileStore.findFollow(context, item.optInt("id"));
+                if (current != null) schedule(context, current);
+            }
+        }
+    }
+
+    private static void catchUpVerifiedEpisodes(Context context, JSONObject follow) {
+        JSONArray rows = follow.optJSONArray("episodeSchedule");
+        if (!"bangumi".equals(follow.optString("source")) || rows == null) return;
+        long now = System.currentTimeMillis() / 1000L;
+        long from = Math.max(now - 86400L, follow.optLong("followedAt", 0));
+        for (int index = 0; index < rows.length(); index++) {
+            JSONObject row = rows.optJSONObject(index);
+            if (row == null) continue;
+            int episode = row.optInt("episode");
+            long at = row.optLong("airingAt");
+            if (at >= from && episode > follow.optInt("watchedEpisode", 0)
+                && EpisodeSchedule.canNotify(follow, episode, at, now)) {
+                deliverAired(context, follow, episode, at, row.optLong("episodeId"));
+            }
         }
     }
 
@@ -56,13 +77,17 @@ final class NotificationScheduler {
         int animeId = follow.optInt("id");
         // Bangumi 状态驱动追踪：仅“在看”（doing，或缺省/未知按在看处理）排新集播出闹钟；
         // 其他状态（wish/done/on_hold/dropped）不提醒新集，已排的闹钟在此取消。
-        String bangumiStatus = MobileStore.followBangumiStatus(follow);
-        if (!bangumiStatus.isEmpty() && !"doing".equals(bangumiStatus)) {
+        if (!EpisodeSchedule.tracks(follow)) {
             cancel(context, animeId);
             return;
         }
         int episode = follow.optInt("nextEpisode");
         long airingAt = follow.optLong("nextAiringAt");
+        if ("bangumi".equals(follow.optString("source"))
+            && !"instant".equals(follow.optString("nextAiringPrecision"))) {
+            cancel(context, animeId);
+            return;
+        }
         if (animeId <= 0 || episode <= 0 || airingAt <= 0) {
             cancel(context, animeId);
             return;
@@ -109,7 +134,14 @@ final class NotificationScheduler {
     static void handleAired(Context context, int animeId, int episode, long airingAt) {
         JSONObject follow = MobileStore.findFollow(context, animeId);
         if (follow == null || follow.optInt("nextEpisode") != episode || follow.optLong("nextAiringAt") != airingAt) return;
+        if (!EpisodeSchedule.canNotify(follow, episode, airingAt, System.currentTimeMillis() / 1000L)) return;
+        deliverAired(context, follow, episode, airingAt, follow.optLong("nextEpisodeId"));
+        MobileStore.advanceAiredSchedule(context, animeId);
+        BackgroundSync.enqueueImmediate(context);
+    }
 
+    private static void deliverAired(Context context, JSONObject follow, int episode, long airingAt, long episodeId) {
+        int animeId = follow.optInt("id");
         JSONObject event = new JSONObject();
         boolean english = "en-US".equals(MobileStore.uiLanguage(context));
         String title = follow.optString("displayTitle", english ? "Untitled anime" : "未命名番剧");
@@ -121,15 +153,24 @@ final class NotificationScheduler {
             event.put("episode", episode);
             event.put("airingAt", airingAt);
             event.put("createdAt", System.currentTimeMillis() / 1000L);
+            event.put("syncUpdatedAt", System.currentTimeMillis());
+            event.put("status", "pending");
+            event.put("statusSource", "airing");
+            event.put("completedAt", JSONObject.NULL);
+            event.put("airingPrecision", "instant");
+            if ("bangumi".equals(follow.optString("source"))) {
+                event.put("subjectId", animeId);
+                event.put("episodeId", episodeId);
+                event.put("episodeType", "regular");
+                event.put("episodeSortKey", String.valueOf(episode));
+            }
         } catch (JSONException ignored) {
             return;
         }
 
         boolean createTask = MobileStore.createTasksEnabled(context);
         boolean isNew = MobileStore.addAiredEvent(context, event, createTask);
-        MobileStore.updateSchedule(context, animeId, null, null, null);
         if (isNew && MobileStore.notificationsEnabled(context)) showNotification(context, animeId, episode, title, createTask);
-        BackgroundSync.enqueueImmediate(context);
     }
 
     private static void showNotification(Context context, int animeId, int episode, String title, boolean taskCreated) {

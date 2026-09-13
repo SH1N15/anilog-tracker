@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- 当前正式版：`v0.7.3`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest。
+- 当前正式版：`v0.7.4`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest；Android `versionCode=13`。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
@@ -15,6 +15,8 @@
 - 标准版使用 Cargo feature `standard`；Original 使用 `original`。两者不能同时启用。
 - Original 的 Rust、前端和 Android 三层都不得请求 Bangumi；标准版默认 Bangumi 反代为 `https://sh1n.cc.cd/v0`。
 - 取消追番只删除对应作品的未完成任务；已完成任务必须作为观看历史保留。
+- 共用 AniList ID 的 Bangumi 分篇必须按各自 subject/episode 保留任务；日期级日程不得触发精确通知，不得仅凭 `episode >= nextEpisode` 删除已播任务。
+- Android 前后台必须传递完整任务记录及时间戳；自动补回的 `statusSource=airing` 待看任务不得覆盖已完成记录，手动撤销仍按更新时间合并。
 - WebDAV 只同步 `following`、`tasks`、`followingDeletedAt`，不得同步设备设置、通知开关、缓存或凭据。
 - WebDAV 凭据不得进入状态 JSON、日志、提交、Issue 或文档。Windows 密码使用 Credential Manager，Android 密码使用 Android Keystore。
 - Android 的 `createWatchTasks=false` 只关闭手机端自动创建观看任务，不得关闭播出通知。
@@ -40,4 +42,4 @@
 
 - 不把 WebDAV 账户、应用专用密码、签名密钥及其本机路径或用户状态提交到 Git。
 - 不自动提交、推送、合并 PR、发布 Release 或标记 Latest，除非用户明确授权。
-- 构建产物可清理，但 `release/tauri-v0.6.0-beta.1`、`release/tauri-v0.6.0-beta.2`、`release/tauri-v0.6.0`、`release/tauri-v0.7.1` 和 `release/tauri-v0.7.2` 是本机发布安装包备份且受 Git 忽略。删除前应再次征得用户同意。
+- 构建产物可清理，但 `release/tauri-v*` 中已有安装包（包括 `v0.7.4-rc.1` 验收包和 `v0.7.4` 正式包）是本机发布或回退备份且受 Git 忽略。删除前应再次征得用户同意。

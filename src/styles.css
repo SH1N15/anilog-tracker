@@ -214,6 +214,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .following-copy span { margin-bottom: 5px; color: var(--green); font-size: 9px; }
 .following-copy strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .following-copy small { margin-top: 5px; color: #8a928d; font-size: 9px; }
+.following-copy { min-width: 0; }
+.following-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-top: 4px; font-size: 12px; }
+.following-controls label { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; max-width: 100%; }
+.following-controls label svg { flex: 0 0 auto; }
+.following-copy .following-progress { flex: 0 0 auto; margin-bottom: 0; white-space: nowrap; opacity: .7; }
 .following-name { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .following-name strong { min-width: 0; }
 .following-name button, .title-editor button { width: 27px; height: 27px; display: grid; place-items: center; flex: 0 0 27px; padding: 0; border: 1px solid var(--line); border-radius: 5px; color: #68716c; background: #fff; cursor: pointer; }
@@ -361,7 +366,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .task-state { padding: 4px; }
   .following-row { grid-template-columns: 47px minmax(0, 1fr) 36px; gap: 10px; }
   .following-row > img { width: 47px; height: 66px; }
+  .following-copy { grid-column: 2 / 4; }
   .following-next { grid-column: 2 / 4; padding: 9px 0 0; border-top: 1px solid var(--line); border-left: 0; }
+  .following-row > .danger { grid-column: 1; grid-row: 2; align-self: end; }
   .setting-row { padding: 12px 14px; }
   .webdav-setting { padding: 14px; }
   .webdav-fields { grid-template-columns: 1fr; }

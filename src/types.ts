@@ -40,6 +40,7 @@ export interface AiringEpisode {
   episode: number;
   airingAt: number;
   timeUntilAiring?: number;
+  airingPrecision?: 'instant' | 'date' | 'unknown';
 }
 
 // Bangumi 收藏状态（SubjectCollectionType：wish/doing/done/on_hold/dropped）。
@@ -82,7 +83,9 @@ export interface WatchTask {
   coverImage?: string;
   episode: number;
   airingAt: number;
+  airingPrecision?: 'instant' | 'date' | 'unknown';
   status: 'pending' | 'completed';
+  statusSource?: 'airing' | 'local' | 'bangumi';
   createdAt: number;
   completedAt: number | null;
   syncUpdatedAt?: number;
