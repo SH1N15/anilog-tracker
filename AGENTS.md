@@ -5,6 +5,7 @@
 ## 当前状态
 
 - 当前正式版：`v0.7.4`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest；Android `versionCode=13`。
+- 当前维护安排：本地与 GitHub 暂时固定使用 `v0.7.4`，应用源码基线为标签 `v0.7.4`（`090593d`）。不继续 API 请求/缓存优化或下一版开发；只有维护者明确提出新任务后才开展变更。维护状态可作纯文档同步，不移动发布标签或覆盖既有附件。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。

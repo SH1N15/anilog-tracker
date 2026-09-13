@@ -2,6 +2,8 @@
 
 来源：2026-07-30 对 `v0.6.0-beta.1` Tauri 迁移的审查，以及 `v0.6.0-beta.2` 修复阶段的复核。
 
+当前本地与 GitHub 暂时固定为 `v0.7.4`。下文保留历史核验和已知状态，不代表当前开发排期；未经维护者新的明确要求，不据此自动开展优化或下一版开发。
+
 ## beta.2 已实现并完成公开验证
 
 - **[#4] Windows 单实例**：使用 Windows 限定的官方 `tauri-plugin-single-instance`，重复启动统一调用现有窗口重建、显示与聚焦路径。标准版与 Original 的 identifier 不同，可以各运行一个实例。
@@ -22,7 +24,7 @@
 
 `src-tauri/tauri.android-original.conf.json` 不需要重复声明 `versionCode`。Tauri 会将基础配置写入生成的 `tauri.properties`，标准版和 Original 共用该版本号；Gradle 只按 edition 环境变量切换 `applicationId`。
 
-## 后续安全加固
+## 已知状态（未排期）
 
 ### CSP 仍关闭
 
@@ -32,7 +34,7 @@
 "security": { "csp": null }
 ```
 
-启用 CSP 需要同时覆盖 Tauri IPC、远程 AniList 图片、React 内联背景样式和 Vite 开发 WebSocket，并在 Windows/Android 两端验证。该项不与本轮三个功能 issue 混合发布，后续应单独实施和回归，且不得放宽远程脚本来源。
+此项保留为已知状态，当前不改动。若维护者另行要求启用 CSP，需要同时覆盖 Tauri IPC、远程 AniList 图片、React 内联背景样式和 Vite 开发 WebSocket，并在 Windows/Android 两端单独验证，且不得放宽远程脚本来源。
 
 ### Original 中文产品名显示（已修正）
 
