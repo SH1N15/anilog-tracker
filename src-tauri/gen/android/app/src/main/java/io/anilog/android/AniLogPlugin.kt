@@ -38,13 +38,18 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
         activity.applicationContext,
         following,
         pendingTasks,
+        args.optJSONObject("followingDeletedAt") ?: JSONObject(),
         args.optBoolean("notificationsEnabled", true),
         args.optBoolean("createTasksEnabled", true),
         args.optBoolean("dailyTaskReminderEnabled", false),
         args.optString("dailyTaskReminderTime", "20:00"),
         args.optString("uiLanguage", "zh-CN")
       )
-      val currentIds = (0 until following.length()).mapNotNull { following.optJSONObject(it)?.optInt("id") }.toSet()
+      MobileStore.setBangumiApiBaseUrl(activity.applicationContext, if (BuildConfig.isOriginalEdition) "" else args.optString("bangumiApiBaseUrl", ""))
+      MobileStore.setPullCollectionsEnabled(activity.applicationContext, !BuildConfig.isOriginalEdition && args.optBoolean("pullCollections", false))
+      AniListScheduler.refreshCachedSchedules(activity.applicationContext)
+      val current = MobileStore.following(activity.applicationContext)
+      val currentIds = (0 until current.length()).mapNotNull { current.optJSONObject(it)?.optInt("id") }.toSet()
       for (index in 0 until before.length()) {
         before.optJSONObject(index)?.optInt("id")?.takeIf { it !in currentIds }?.let { NotificationScheduler.cancel(activity.applicationContext, it) }
       }
@@ -142,6 +147,7 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
       .put("exactSchedulingGranted", Build.VERSION.SDK_INT < 31 || alarms.canScheduleExactAlarms())
       .put("events", events)
       .put("following", MobileStore.following(activity.applicationContext))
+      .put("document", BackgroundSyncWorker.localDocument(activity.applicationContext))
       .put("syncedAt", MobileStore.lastSyncAt(activity.applicationContext))
       .put("openTasks", consumeOpenTasks && MobileStore.consumeOpenTasks(activity.applicationContext))
   }

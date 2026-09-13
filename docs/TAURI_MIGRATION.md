@@ -1,6 +1,6 @@
 # Tauri 架构与迁移说明
 
-AniLog 已在 `v0.6.0` 正式迁移到 Tauri 2，并以该版本作为 GitHub Latest。现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为回退路径，后续清理必须作为独立任务规划。
+AniLog 自 `v0.6.0` 起正式采用 Tauri 2，当前正式版为 `v0.7.4`。现有 `electron/`、`android/` 与 v0.5.0 构建流程暂时保留为回退路径，后续清理必须作为独立任务规划。
 
 ## 架构
 
@@ -8,9 +8,10 @@ AniLog 已在 `v0.6.0` 正式迁移到 Tauri 2，并以该版本作为 GitHub La
 - `src/platform/tauri.ts`：React 到 Tauri command 的平台适配层。
 - `src-tauri/src/lib.rs`：Rust 共享核心，负责状态、AniList、季度缓存、追番、观看任务、Bangumi 标题和 WebDAV 合并。
 - `src-tauri/src/mobile.rs`：Rust 与 Android 原生插件的桥接。
+- `src-tauri/src/mobile_state.rs`：完整原生快照、任务时间戳和本机派生日程合并。
 - `src-tauri/gen/android/`：Tauri Android 工程；AlarmManager、WorkManager、通知、Keystore 和 WebDAV 传输继续由 Android 原生代码实现。
 
-标准版启用 Cargo feature `standard`，优先使用构建时从 `bangumi-data` 提取的精简 AniList ID 映射补充中文标题，只有本地无法确定时才访问项目维护的 Bangumi 反代。当前映射约 0.4 MB；唯一 AniList ID 只保存 Bangumi ID 和中文名，少量重复 ID 才携带消歧字段。Original 启用 `original`，构建产物只写入空映射，所有 Bangumi 调用也在 Rust 层禁用。两种 feature 不应同时启用。
+标准版启用 Cargo feature `standard`，以 Bangumi 为季度条目和逐集身份的主数据源，构建内置 `bangumi-data` 映射与元数据，AniList 只为已匹配集数补充精确时间。Bangumi 季度链无缓存且不可用时保留 AniList 回退。Original 启用 `original`，使用空映射并在 Rust、前端和 Android 三层阻断 Bangumi 请求。两种 feature 不应同时启用。
 
 ## 已接通的功能
 
@@ -27,7 +28,8 @@ AniLog 已在 `v0.6.0` 正式迁移到 Tauri 2，并以该版本作为 GitHub La
 - Windows 标准版与 Original 分别保持单实例；重复启动会恢复已有窗口，不会重复启动后台任务。
 - Windows 可隐藏托盘图标，后台同步和通知保持不变；再次启动快捷方式可恢复已有窗口。
 - 新番列表可按本机星期分组，也可切换回完整列表。
-- Bangumi 请求全局串行且至少间隔 450 ms，整体不可用时暂停 10 分钟；成功中文名缓存 180 天，未匹配的未来作品缓存 1 天，已播作品缓存 7 天。
+- 中文标题解析链请求串行且至少间隔 450 ms，整体不可用时暂停 10 分钟；成功中文名缓存 180 天，未匹配的未来作品缓存 1 天，已播作品缓存 7 天。其他 Bangumi API 由各自客户端限流和缓存。
+- `v0.7.4` 的完整 Android 快照合并、日期/时刻分离、分篇任务保留和进度修复，详见 [WATCH_STATE_REGRESSIONS.md](WATCH_STATE_REGRESSIONS.md)。
 
 ## 本地数据
 
@@ -41,7 +43,7 @@ Android 的 AlarmManager 和 WorkManager 任务由系统持有，不要求应用
 
 ## 开发与测试
 
-需要 Node.js 22、Rust 1.85 或更高版本。Android 构建使用 JDK 17 或 21、Android SDK 36 和 NDK；当前 Gradle/Kotlin 工具链不支持 JDK 25。
+需要 Node.js 22、Rust 1.85 或更高版本。当前 Android 构建使用 JBR/JDK 21、Android SDK 36 和 NDK `27.2.12479018`。本机 JDK 17 和 JDK 25 均不用于正式构建。
 
 ```powershell
 npm ci
@@ -64,7 +66,7 @@ npm run tauri:build:original
 Android Debug APK：
 
 ```powershell
-$env:JAVA_HOME='C:\Program Files\Java\jdk-17'
+# JAVA_HOME must already point to a compatible JBR/JDK 21 installation.
 $env:PATH="$env:JAVA_HOME\bin;$env:PATH"
 $env:ANILOG_ANDROID_EDITION='standard'
 npx tauri android build --debug --target aarch64 --features standard --apk --ci

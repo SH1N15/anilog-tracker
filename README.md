@@ -32,14 +32,16 @@ Local-first anime schedule, notification, episode task manager, optional Bangumi
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 正式版 v0.7.3
+### 正式版 v0.7.4
 
-- [`AniLog-Windows-v0.7.3-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Windows-v0.7.3-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.7.3-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Original-Windows-v0.7.3-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.7.3-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Android-v0.7.3-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
-- [`AniLog-Original-Android-v0.7.3-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.3/AniLog-Original-Android-v0.7.3-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
+- [`AniLog-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Windows-v0.7.4-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Original-Windows-v0.7.4-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.7.4-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Android-v0.7.4-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.7.4-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Original-Android-v0.7.4-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-`v0.7.3` 已正式发布，修复 Android 季度缓存重启后失效、过期缓存阻塞首屏，以及新番详情页在窄屏设备横向溢出的问题；同时包含 v0.7.2 的 Bangumi 分季集号、任务和分钟级时间修复。它会覆盖对应 edition 的旧版安装；升级前建议先启用 WebDAV 同步或备份 Windows 安装目录中的 `data` 文件夹。
+`v0.7.4` 修复 Android 待看任务消失、提前提醒和更新时间反复待定，修复勾选或撤销后的观看进度不同步，以及手机进度文字竖排。共用 AniList ID 的分篇作品现在独立保留任务，自动补回任务不会覆盖已完成记录。完整变化和 SHA-256 见 [发布说明](release-notes/v0.7.4.md)。
+
+**请同时升级 Windows 和 Android 对应版本**，让两端使用一致的任务合并规则。安装前备份 Windows 安装目录中的 `data`，退出包括托盘在内的电脑端程序后覆盖安装；Android 直接覆盖安装，不要先卸载。正式版 Android `versionCode=13`，可覆盖 `v0.7.3` 和本地测试版 `v0.7.4-rc.1`。
 
 - 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -64,26 +66,26 @@ Windows 版将追番记录、观看任务、缓存和设置保存在 `<安装目
 - 标准版可选连接 Bangumi 账户：同步追番状态、评分和已完成集数；Token 仅保存在系统安全存储中，不上传 WebDAV
 - 新番列表优先显示 Bangumi 中文标题，匹配不到时回退到英文
 - 中文标题会用于搜索、通知和观看任务，也可在“我的追番”中自定义
-- 原名版完全不连接 Bangumi；Windows 安装时可选中英文，Windows 与 Android 均可在“偏好设置 → 语言与番名”中切换界面语言及英文、罗马字或日文标题
+- 原名版完全不连接 Bangumi；Windows 与 Android 均可在“偏好设置 → 语言与番名”中切换中英文界面及英文、罗马字或日文标题
 - 勾选每集任务，保留已完成观看记录
 - 默认本地保存；WebDAV 同步为可选功能，缓存、通知和设备偏好不会上传
 
 ## 开发
 
-需要 Node.js 22。
+需要 Node.js 22、Rust 1.85+；Windows 原生开发使用 Tauri 2。
 
 ```powershell
 npm ci
-npm run dev
+npm run tauri:dev
 ```
 
 使用原名版配置开发运行：
 
 ```powershell
-npm run dev:original
+npm run tauri:dev:original
 ```
 
-`v0.7.3` 是当前 Tauri 2 正式版。新架构共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.7.4` 是当前 Tauri 2 正式版。共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。仅预览界面可使用 `npm run dev:tauri:web`；旧 `npm run dev` 启动的是 Electron 回退实现。Android 构建使用 JBR/JDK 21。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 
@@ -104,31 +106,34 @@ Windows 开机自启使用隐藏启动参数，登录后直接驻留托盘，不
 
 Android 首次追番时需要允许通知。未授予“准时通知”权限时系统仍会发送通知，但可能略有延迟；部分设备还需要将 AniLog 的电池策略设为“不限制”。在系统设置中“强行停止”应用会暂停后台调度，重新打开一次即可恢复。
 
-标准版使用 AniList GraphQL API 获取公开番剧与分钟级播出日程，使用 Bangumi 逐集数据确定作品/分季的本地集号，并使用 `bangumi-data` 和 Bangumi API 补充中文标题与条目信息。基础功能无需账号；Bangumi Access Token 仅在启用账户同步时需要。AniList 暂时不可用时，应用不会用周播锚点猜测集数，而是保留最近一次可信的精确时间或退回日期级信息，待服务恢复后自动纠偏。
+标准版以 Bangumi 为季度条目和逐集身份的主数据源，使用 `bangumi-data` 提供离线映射和元数据，使用 AniList 补充匹配集数的分钟级播出时间；Bangumi 季度链不可用且无缓存时可回退到 AniList。基础功能无需账号；Bangumi Access Token 在连接账户后用于认证请求。AniList 暂时不可用时，应用保留最近一次可信的精确时间或退回日期级信息，不按周播锚点猜测集数，也不会把日期占位当成精确播出时间发送 Android 提醒。
 
 Bangumi 账户同步与 WebDAV 是两个独立通道。Bangumi 账户同步可以拉取追番状态、回写本地状态/评分/观看进度；WebDAV 只同步 `following`、`tasks` 和取消追番记录，不同步 Token、缓存、设备设置或通知开关。
 
-AniLog 原名版只使用 AniList GraphQL API。它不会加载 `bangumi-data`，不会注册 Bangumi 通信接口，也不会向 Bangumi 官方 API 或第三方反代发送请求。默认按“英文 → 罗马字 → 日文”显示标题，也可以在设置中改变首选顺序。应用的其他功能与中文标题标准版一致。
+AniLog 原名版只使用 AniList GraphQL API。它不会加载 `bangumi-data`，也不会向 Bangumi 官方 API 或第三方反代发送请求。默认按“英文 → 罗马字 → 日文”显示标题，也可以在设置中改变首选顺序。追番、任务、通知和 WebDAV 功能与标准版共用，Bangumi 账户功能仅限标准版。
 
 ## English
 
 AniLog Original is a local-first anime schedule, release notification, and episode task tracker for Windows and Android. It uses AniList titles only and never connects to Bangumi or a third-party Bangumi proxy.
 
-- The Windows installer lets you choose English or Simplified Chinese and remembers that choice on first launch.
-- The Android Original app follows the system language on first launch. You can switch languages later under **Settings → Language and titles**.
+- Both Windows and Android support English and Simplified Chinese under **Settings → Language and titles**.
 - English title order defaults to English, then Romaji, then Japanese. The order can be changed in Settings.
 - Following, watch tasks, notifications, local storage, and optional user-owned WebDAV sync work in both languages.
 - Optional daily watch-task summaries use local data only and open the task list when tapped.
 
 Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
 
+Version 0.7.4 fixes task retention and sync consistency, premature Android alerts,
+stale progress, and narrow-screen progress layout. Upgrade both devices together
+and install the Android update over the existing app without uninstalling it.
+
 中文标题首先来自 `bangumi-data` 的本地节目数据，缺失条目再通过 Bangumi API 查询。应用只查询进入可视区域且尚未缓存的条目，并在网络异常时自动暂停请求。
 
 本地解析优先读取 `bangumi-data` 提供的 AniList ID 映射，再回退到规范化标题、完整首播日期、季度或 Stage 编号、词序相似度和作品类型匹配。一条 AniList 作品对应多个 Bangumi 篇章时，仅在中文标题拥有足够长的共同前缀时合并显示。匹配缓存带有解析器版本，升级算法后会自动重新检查旧的未匹配与歧义结果。
 
-中国大陆网络无法直连 Bangumi 时，标准版默认使用项目维护者部署的反代地址。项目维护者不保证该反代一直生效，用户也可在“偏好设置 → 中文标题网络”中填写其他 HTTPS API 反代地址，或清空地址改用官方 API。地址可填域名根路径或以 `/v0` 结尾的 API 根路径，应用会测试连接后保存；反代失败时自动尝试官方 API，最终回退到本地标题数据。
+中国大陆网络无法直连 Bangumi 时，标准版默认使用项目维护者部署的反代地址。项目维护者不保证该反代一直生效，用户也可在“偏好设置 → 中文标题网络”中填写其他 HTTPS API 反代地址，或清空地址改用官方 API。地址可填域名根路径或以 `/v0` 结尾的 API 根路径；中文标题解析链会在反代失败时尝试官方 API 和本地数据，其他 Bangumi 请求按各自缓存与错误处理规则降级。
 
-默认反代基于 [makabaka11/bangumi-proxy-workers](https://github.com/makabaka11/bangumi-proxy-workers) 部署。反代服务可看到请求来源 IP 和被搜索的番剧标题；应用不发送追番清单、观看任务或 Bangumi 登录凭据。
+默认反代基于 [makabaka11/bangumi-proxy-workers](https://github.com/makabaka11/bangumi-proxy-workers) 部署。反代可看到请求来源 IP 和查询内容；连接 Bangumi 账户后，经该地址发出的认证请求还会携带 Access Token，账户同步会传输收藏、评分和进度。请只使用可信反代，或清空地址直连官方 API。WebDAV 仍是独立通道，不上传 Bangumi Token、缓存或设备设置。
 
 `bangumi-data` 由 [bangumi-data 项目](https://github.com/bangumi-data/bangumi-data)维护，依据 CC BY 4.0 许可使用。
 

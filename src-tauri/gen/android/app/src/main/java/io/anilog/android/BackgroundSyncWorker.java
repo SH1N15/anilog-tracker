@@ -118,20 +118,19 @@ public class BackgroundSyncWorker extends Worker {
 
         WebDavClient client = new WebDavClient();
         WebDavClient.Download download = client.download(config);
-        JSONObject local = localDocument(context);
+        Set<Integer> before = currentFollowIds(context);
         SyncMerge.Result result;
         if (download.found) {
             String body = download.body;
             SyncMerge.validateDocument(body);
-            result = SyncMerge.merge(local, new JSONObject(body));
+            result = MobileStore.mergeDocument(context, new JSONObject(body));
         } else {
             // 远端无文档：视作空文档合并（远端必然缺本地内容 → 首次上传）。
-            result = SyncMerge.merge(local, SyncMerge.emptyDocument());
+            result = MobileStore.mergeDocument(context, SyncMerge.emptyDocument());
         }
 
-        if (result.localChanged || download.found) {
-            applyMerged(context, result.merged, removedFollowIds);
-        }
+        removedFollowIds.addAll(before);
+        removedFollowIds.removeAll(currentFollowIds(context));
 
         // 云端文档可能还带着旧的未来假票。先合并，再用 Bangumi episode
         // 表清理，最后重新投影上传；这样 AniList 暂停或分季错位都不会让
@@ -169,7 +168,7 @@ public class BackgroundSyncWorker extends Worker {
     }
 
     /** 本地文档（MobileStore 投影）：following + pendingTasks + 墓碑。 */
-    static JSONObject localDocument(Context context) throws org.json.JSONException {
+    static JSONObject localDocument(Context context) throws org.json.JSONException, SyncMerge.MergeException {
         JSONObject document = SyncMerge.emptyDocument();
         document.put("following", MobileStore.following(context));
         JSONArray pendingTasks = MobileStore.allTasks(context);
@@ -192,22 +191,7 @@ public class BackgroundSyncWorker extends Worker {
         document.put("followingDeletedAt", MobileStore.tombstones(context));
         document.put("updatedAt", SyncMerge.documentUpdatedAt(
             document.optJSONArray("following"), tasks, document.optJSONObject("followingDeletedAt")));
-        return document;
-    }
-
-    /** 合并结果写回 MobileStore（通知/任务生成、前台 Rust 细化合并的数据源）。 */
-    private static void applyMerged(Context context, JSONObject merged, Set<Integer> removedFollowIds) {
-        Set<Integer> before = currentFollowIds(context);
-        JSONArray following = merged.optJSONArray("following");
-        MobileStore.setFollowing(context, following);
-        JSONArray tasks = merged.optJSONArray("tasks");
-        // 保留 pending 与 completed 全部记录；WebDAV 契约同步观看历史，不能
-        // 只写回当前待看任务，否则后台合并会抹掉已完成集。
-        MobileStore.setTasks(context, tasks);
-        MobileStore.setTombstones(context, merged.optJSONObject("followingDeletedAt"));
-        removedFollowIds.addAll(before);
-        Set<Integer> after = currentFollowIds(context);
-        removedFollowIds.removeAll(after);
+        return SyncMerge.normalizeDocument(document);
     }
 
     private static Set<Integer> currentFollowIds(Context context) {

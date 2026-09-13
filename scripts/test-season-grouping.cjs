@@ -19,7 +19,7 @@ compiled.filename = path.join(root, 'src', 'utils.ts');
 compiled.paths = Module._nodeModulePaths(root);
 compiled._compile(output, compiled.filename);
 
-const { localAiringWeekday } = compiled.exports;
+const { localAiringWeekday, formatAiring, relativeTime } = compiled.exports;
 const now = Date.UTC(2026, 6, 26) / 1000;
 const timestamp = (year, month, day, hour = 0) => Date.UTC(year, month - 1, day, hour) / 1000;
 
@@ -36,5 +36,9 @@ assert.equal(localAiringWeekday({
 }, now), 0);
 assert.equal(localAiringWeekday({ airingSchedule: { nodes: [{ airingAt: timestamp(2026, 7, 20) }] } }, now), 7);
 assert.equal(localAiringWeekday({}, now), 7);
+const dateOnly = timestamp(2026, 9, 10);
+assert.ok(!formatAiring(dateOnly, true, 'en-US', 'date').includes(':'), 'date-only values must not display a fabricated time');
+assert.equal(relativeTime(dateOnly, 'en-US', 'date'), 'Time TBA');
+assert.equal(relativeTime(dateOnly, 'en-US', 'unknown'), 'Time TBA');
 
 console.log('Season grouping tests passed.');

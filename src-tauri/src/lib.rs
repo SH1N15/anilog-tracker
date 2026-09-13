@@ -38,6 +38,10 @@ pub mod bangumi;
 
 #[cfg(target_os = "android")]
 mod mobile;
+#[cfg(any(target_os = "android", test))]
+mod mobile_state;
+#[cfg(all(test, feature = "standard"))]
+mod watch_progress_tests;
 
 const ANILIST_API: &str = "https://graphql.anilist.co";
 const OFFICIAL_BANGUMI_API: &str = "https://api.bgm.tv/v0";
@@ -1606,7 +1610,10 @@ fn reconcile_anilist_authority_tasks(state: &mut Value, map: &Value) -> bool {
         if episode > 0 && eps > 0 && episode > eps {
             return false; // a) 越过 eps 的离线残留任务。
         }
-        !secondary.contains(&value_i64(entry.get("id"))) // b) 非主条目 pending。
+        // Distinct Bangumi subjects may share one AniList media. Their local
+        // episode tasks are not duplicates (Re:Zero's two fourth-season parts).
+        value_string(entry.get("source")) == "bangumi"
+            || !secondary.contains(&value_i64(entry.get("id")))
     });
     before != tasks.len()
 }
@@ -1659,6 +1666,9 @@ fn purge_pre_follow_pending_tasks(state: &mut Value) -> bool {
         if value_string(task.get("status")) != "pending" {
             return true; // completed 观看历史永不删除。
         }
+        if value_i64(task.get("episodeId")) > 0 {
+            return true; // A verified episode survives a later re-follow.
+        }
         let Some(&followed_at) = followed_at_by_anime_id.get(&value_i64(task.get("animeId")))
         else {
             return true;
@@ -1690,71 +1700,6 @@ fn purge_unaired_pending_tasks(state: &mut Value, now: i64) -> bool {
     before != tasks.len()
 }
 
-/// 权威数据修复（缺口 2 无网络版任务纠偏，幂等，standard only）：条目 AniList
-/// 身份（id 或 anilistId）的 nextAiringEpisode.episode 已知时，episode >=
-/// next.episode 的 pending 任务删除——AniList 认为未播的集不该有票（播出后由
-/// 调度管道按权威时间重建）。与 [`purge_unaired_pending_tasks`] 互补：purge
-/// 只删 airingAt > now 的未来时间戳，拦不住离线锚点污染出的"过去假票"（黄泉
-/// ep23@9/6、无职 ep11@9/6 23:00 已过当晚等）；这里按 AniList 的集数权威兜底，
-/// 无论 airingAt 过去/未来都删。completed 观看历史一律保留。
-///
-/// 挂载点（第 6 轮误删事故后收敛为 Android only）：mobile merge_status
-/// （Java Worker 提供的 nextEpisode 与 Rust 条目 nextAiringEpisode 同源同
-/// 口径）。桌面已撤销此清理——`reconcile_following_entries` 不再调用（桌面
-/// 条目 next 可能被离线锚点污染，>= next 判定曾把真实已播任务误删，且任务
-/// id 已在 seenAiringEvents 中、AIRING_QUERY 窗口永不重建）；桌面任务纠偏与
-/// 缺失回填由 `anilist_authority_refresh`/`apply_anilist_authority_media`
-/// 的权威 schedule 承担。cfg 门控 `any(target_os = "android", test)`：Android
-/// 正式构建编译（mobile.rs 调用），桌面仅在单测中编译（Android 语义纯函数
-/// 层验证），桌面正式构建不编译、无 dead_code。
-/// 任务归属口径与 [`reconcile_anilist_authority_tasks`] 一致：animeId 直接
-/// 命中条目 id，否则回退 bangumi 条目 anilistId（旧键）。
-#[cfg(all(feature = "standard", any(target_os = "android", test)))]
-fn reconcile_unaired_anilist_next_tasks(state: &mut Value) -> bool {
-    let following = state["following"].as_array().cloned().unwrap_or_default();
-    // 任务 animeId → 已知 next.episode（条目 id 与旧键 anilistId 双键收录；
-    // 两者撞键时同属一个 AniList 作品，next 值一致，覆盖无害）。
-    let mut next_by_anime_id: HashMap<i64, i64> = HashMap::new();
-    for entry in &following {
-        let id = value_i64(entry.get("id"));
-        let next_episode = value_i64(
-            entry
-                .get("nextAiringEpisode")
-                .and_then(|next| next.get("episode")),
-        );
-        if id <= 0 || next_episode <= 0 {
-            continue;
-        }
-        next_by_anime_id.insert(id, next_episode);
-        let anilist_id = value_i64(entry.get("anilistId"));
-        if anilist_id > 0 {
-            next_by_anime_id.insert(anilist_id, next_episode);
-        }
-    }
-    if next_by_anime_id.is_empty() {
-        return false;
-    }
-    let Some(tasks) = state
-        .get_mut("tasks")
-        .and_then(|tasks| tasks.as_array_mut())
-    else {
-        return false;
-    };
-    let before = tasks.len();
-    tasks.retain(|task| {
-        if value_string(task.get("status")) != "pending" {
-            return true; // completed 观看历史永不删除。
-        }
-        let next_episode = next_by_anime_id
-            .get(&value_i64(task.get("animeId")))
-            .copied()
-            .unwrap_or(0);
-        let episode = value_i64(task.get("episode"));
-        !(next_episode > 0 && episode > 0 && episode >= next_episode)
-    });
-    before != tasks.len()
-}
-
 /// 问题 B 总入口（standard only）：跨键合并 + 既有单条自动映射。
 /// 返回是否发生任何状态变更（following/tasks/syncMetadata 任一）。
 /// 挂载点：load_context 尾部（升级原 auto_map_following 调用）与每次
@@ -1780,20 +1725,15 @@ fn reconcile_following_entries(state: &mut Value, map: &Value, original: bool) -
     // 验收第 4 轮问题 1：从未播出（airingAt > now）的 pending 任务清理，
     // 幂等；original 分支已在函数头返回，不会执行到这里。
     purge_unaired_pending_tasks(state, now_seconds());
-    // 第 6 轮误删事故（100女友 ep10 已播任务被删）后，桌面撤销"无网络
-    // 清理"：reconcile_unaired_anilist_next_tasks 按条目 nextAiringEpisode
-    // 判定 episode >= next 即假票，但桌面 next 可能仍被离线锚点污染
-    // （污染 next=ep10@9/9 时，真实已播 ep10 任务被误删，且 seenAiringEvents
-    // 已含该 id、AIRING_QUERY 窗口永不重建）。桌面任务纠偏/回填改由
-    // anilist_authority_refresh（权威 next 重写 + schedule 回填）承担；
-    // 该清理仅保留给 Android（mobile merge_status，Java 提供的 next 同
-    // 口径），见函数头说明。
+    // Never retract tasks using a potentially stale next-episode pointer.
+    // Both platforms require an explicit per-episode future fact.
     // 权威数据修复：eps 越界 pending 与共享 anilistId 非主条目 pending 清理
     // （completed 历史一律保留），幂等。
     reconcile_anilist_authority_tasks(state, map);
     // 第 8 轮问题 3：追番前已播历史 pending 洪水清理（幂等，云端合并进来
     // 的存量假票当次清掉，上传文档自愈）。
     purge_pre_follow_pending_tasks(state);
+    heal_following_progress(state);
     let after = (
         state.get("following").cloned().unwrap_or(Value::Null),
         state.get("tasks").cloned().unwrap_or(Value::Null),
@@ -1885,6 +1825,18 @@ fn choose_record(left: Option<&Value>, right: Option<&Value>, fallback: &str) ->
         (None, None) => None,
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
         (Some(left), Some(right)) => {
+            // Regenerating a missing task is not a user request to undo a watch.
+            if fallback == "createdAt" {
+                let generated_pending = |record: &Value| {
+                    record["status"] == "pending" && record["statusSource"] == "airing"
+                };
+                if generated_pending(left) && right["status"] == "completed" {
+                    return Some(right.clone());
+                }
+                if generated_pending(right) && left["status"] == "completed" {
+                    return Some(left.clone());
+                }
+            }
             let left_time = record_timestamp(left, fallback);
             let right_time = record_timestamp(right, fallback);
             if left_time != right_time {
@@ -1931,7 +1883,13 @@ fn document_from_state(state: &mut Value) -> Value {
     // 自行维护；SYNC_VERSION 保持 1（v0.6 上传的带 next 文档读取侧忽略）。
     for item in &mut following {
         if let Some(object) = item.as_object_mut() {
-            object.remove("nextAiringEpisode");
+                for key in [
+                    "nextAiringEpisode", "nextEpisode", "nextAiringAt",
+                    "nextEpisodeId", "nextAiringPrecision", "scheduleUpdatedAt",
+                    "episodeSchedule",
+                ] {
+                    object.remove(key);
+                }
         }
     }
     let mut tasks = state["tasks"].as_array().cloned().unwrap_or_default();
@@ -1985,7 +1943,7 @@ fn merge_document_into_state(
     // 快照恢复"，因为剥键后合并产物天然无 next，必须恢复本地值）；合并落盘
     // 后按条目 id 原样还原（含显式 null；远端复活记录无本地 next → 保持无
     // 键，由本端调度/权威路径重建）。
-    let local_next: HashMap<i64, Option<Value>> = state["following"]
+    let local_next: HashMap<i64, Value> = state["following"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -1993,7 +1951,7 @@ fn merge_document_into_state(
         .map(|item| {
             (
                 value_i64(item.get("id")),
-                item.get("nextAiringEpisode").cloned(),
+                item,
             )
         })
         .collect();
@@ -2122,8 +2080,16 @@ fn merge_document_into_state(
     if let Some(items) = state["following"].as_array_mut() {
         for item in items.iter_mut() {
             let id = value_i64(item.get("id"));
-            if let Some(Some(next)) = local_next.get(&id) {
-                item["nextAiringEpisode"] = next.clone();
+            if let Some(snapshot) = local_next.get(&id) {
+                for key in [
+                    "nextAiringEpisode", "nextEpisode", "nextAiringAt",
+                    "nextEpisodeId", "nextAiringPrecision", "scheduleUpdatedAt",
+                    "episodeSchedule",
+                ] {
+                    if let Some(value) = snapshot.get(key) {
+                        item[key] = value.clone();
+                    }
+                }
             }
         }
     }
@@ -3614,6 +3580,7 @@ fn update_follow_title(
 fn toggle_task_status(task: &mut Value) -> bool {
     let completed = value_string(task.get("status")) == "completed";
     task["status"] = json!(if completed { "pending" } else { "completed" });
+    task["statusSource"] = json!("local");
     task["completedAt"] = if completed {
         Value::Null
     } else {
@@ -3622,10 +3589,70 @@ fn toggle_task_status(task: &mut Value) -> bool {
     task["syncUpdatedAt"] = json!(now_millis());
     let newly_completed = !completed;
     #[cfg(feature = "standard")]
-    if newly_completed && value_i64(task.get("subjectId")) > 0 {
+    if value_i64(task.get("subjectId")) > 0 {
         task["lastChangedBy"] = json!("local");
+        task.as_object_mut().unwrap().remove("lastPushedToBangumiAt");
     }
     newly_completed
+}
+
+#[cfg(feature = "standard")]
+fn completed_progress(state: &Value, entry: &Value) -> i64 {
+    let subject = value_i64(entry.get("id"));
+    let total = value_i64(entry.get("episodes"));
+    state["tasks"].as_array().into_iter().flatten()
+        .filter(|task| {
+            let episode = value_i64(task.get("episode"));
+            (value_i64(task.get("subjectId")) == subject || value_i64(task.get("animeId")) == subject)
+                && value_string(task.get("status")) == "completed"
+                && episode > 0 && (total <= 0 || episode <= total)
+        })
+        .map(|task| value_i64(task.get("episode")))
+        .collect::<HashSet<_>>().len() as i64
+}
+
+#[cfg(feature = "standard")]
+fn heal_following_progress(state: &mut Value) {
+    let counts: Vec<(usize, i64)> = state["following"].as_array().into_iter().flatten()
+        .enumerate()
+        .filter(|(_, entry)| value_string(entry.get("source")) == "bangumi"
+            && entry.get("watchedEpisode").is_some_and(Value::is_number))
+        .map(|(index, entry)| (index, completed_progress(state, entry)))
+        .collect();
+    for (index, count) in counts {
+        if count > value_i64(state["following"][index].get("watchedEpisode")) {
+            state["following"][index]["watchedEpisode"] = json!(count);
+            state["following"][index]["syncUpdatedAt"] = json!(now_millis());
+        }
+    }
+}
+
+#[cfg(feature = "standard")]
+fn update_progress_after_task_toggle(state: &mut Value, task: &Value) {
+    let subject = value_i64(task.get("subjectId"));
+    let episode = value_i64(task.get("episode"));
+    let Some(index) = state["following"].as_array().into_iter().flatten().position(|entry|
+        subject > 0 && value_i64(entry.get("id")) == subject
+            && value_string(entry.get("source")) == "bangumi")
+    else {
+        return;
+    };
+    let entry = &state["following"][index];
+    let total = value_i64(entry.get("episodes"));
+    if episode <= 0 || (total > 0 && episode > total) {
+        return;
+    }
+    let duplicate_completed = state["tasks"].as_array().into_iter().flatten().any(|other|
+        other.get("id") != task.get("id")
+            && (value_i64(other.get("subjectId")) == subject || value_i64(other.get("animeId")) == subject)
+            && value_i64(other.get("episode")) == episode
+            && value_string(other.get("status")) == "completed");
+    let delta = if duplicate_completed { 0 } else if value_string(task.get("status")) == "completed" { 1 } else { -1 };
+    let count = completed_progress(state, entry);
+    let previous = entry.get("watchedEpisode").and_then(Value::as_i64).unwrap_or(count - delta);
+    let progress = (previous + delta).max(count).max(0);
+    state["following"][index]["watchedEpisode"] = json!(if total > 0 { progress.min(total) } else { progress });
+    state["following"][index]["syncUpdatedAt"] = json!(now_millis());
 }
 
 /// 状态驱动追踪（任务 3）完结自动转「看过」内核：任务 newly_completed 后检查
@@ -3708,22 +3735,25 @@ fn toggle_task(
     let mut finale_completed: Option<(i64, String)> = None;
     #[cfg(not(feature = "standard"))]
     let finale_completed: Option<(i64, String)> = None;
-    let bangumi_task_completed;
+    let bangumi_task_changed;
     if let Some(task) = state["tasks"].as_array_mut().and_then(|items| {
         items
             .iter_mut()
             .find(|task| value_string(task.get("id")) == task_id)
     }) {
-        let newly_completed = toggle_task_status(task);
-        bangumi_task_completed = newly_completed && value_i64(task.get("subjectId")) > 0;
+        let _newly_completed = toggle_task_status(task);
+        bangumi_task_changed = value_i64(task.get("subjectId")) > 0;
         // 快照后任务借用即终结，才能再借 &mut state 做条目级完结转换。
         #[cfg(feature = "standard")]
-        if newly_completed {
+        {
             let snapshot = task.clone();
-            finale_completed = mark_entry_done_on_finale(&mut state, &snapshot);
+            update_progress_after_task_toggle(&mut state, &snapshot);
+            if _newly_completed {
+                finale_completed = mark_entry_done_on_finale(&mut state, &snapshot);
+            }
         }
     } else {
-        bangumi_task_completed = false;
+        bangumi_task_changed = false;
     };
     drop(state);
     if let Some((subject_id, display_title)) = finale_completed {
@@ -3735,7 +3765,7 @@ fn toggle_task(
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
     // 问题 2b：bangumi 任务完成 → 动作唤醒桌面自动同步（写回单集进度）。
-    notify_bangumi_sync_wakeup(bangumi_task_completed);
+    notify_bangumi_sync_wakeup(bangumi_task_changed);
     refresh_mobile_configuration(&app, &context)?;
     emit_state(&app, &context);
     Ok(context.public_state())
@@ -3861,8 +3891,8 @@ struct AiringOutcome {
 /// 任务的 (animeId, episode) 与 (subjectId, episode) 两种键身份 + 同集。
 /// 旧版（AniList 主键时代）完成任务挂 anilistId 键，新版 bangumi 条目按
 /// subjectId 生成任务，按任务 id 查重查不到，需按此集合按集拦截。供
-/// apply_airing_schedules 与 Android mobile::merge_status 共用同一判定口径。
-#[cfg(feature = "standard")]
+/// Desktop airing events use this guard; Android merges durable task snapshots.
+#[cfg(all(feature = "standard", any(not(target_os = "android"), test)))]
 fn completed_episode_history(tasks: &Value) -> HashSet<(i64, i64)> {
     let mut history: HashSet<(i64, i64)> = HashSet::new();
     for task in tasks.as_array().into_iter().flatten() {
@@ -3889,7 +3919,7 @@ fn completed_episode_history(tasks: &Value) -> HashSet<(i64, i64)> {
 /// 新集事件命中已完成集合 (S, episode) 或 (A, episode) → 该集已有观看历史，
 /// 应跳过创建 pending 任务。anilist 键条目不经过此守卫（其任务 id 查重本就
 /// 覆盖 completed），由调用方负责。
-#[cfg(feature = "standard")]
+#[cfg(all(feature = "standard", any(not(target_os = "android"), test)))]
 fn completed_history_blocks_event(
     history: &HashSet<(i64, i64)>,
     task_anime_id: i64,
@@ -4129,7 +4159,7 @@ fn apply_airing_schedules_inner(
             .unwrap_or_default()
             .to_string();
         #[cfg_attr(not(feature = "standard"), expect(unused_mut))]
-        let mut new_task = json!({"id": id, "animeId": task_anime_id, "animeTitle": title, "coverImage": cover, "episode": episode, "airingAt": airing_at, "status": "pending", "createdAt": now, "completedAt": null, "syncUpdatedAt": now_millis()});
+        let mut new_task = json!({"id": id, "animeId": task_anime_id, "animeTitle": title, "coverImage": cover, "episode": episode, "airingAt": airing_at, "status": "pending", "statusSource": "airing", "createdAt": now, "completedAt": null, "syncUpdatedAt": now_millis()});
         // standard 版任务补 additive 字段（original 不写，行为不变）。
         // subjectId 按 bangumi_sourced 判定：AniList 离线调度 mediaId=AniList id、
         // Bangumi 离线调度 mediaId=subjectId，两种情况任务键均为 subjectId。
@@ -4521,6 +4551,15 @@ fn bangumi_episode_schedule_with_precision(
                     .unwrap_or(false)
         };
         let is_split_subject = local_and_global.is_some_and(|(local, global)| local != global);
+        let calendar_candidate = || {
+            let date = record_date?;
+            if records.iter().filter(|record| record.ep_type == 0
+                && record.airdate.as_deref().and_then(|date| date.get(..10)) == Some(date)).count() != 1 {
+                return None;
+            }
+            let matches: HashSet<i64> = precise.values().copied().filter(|at| same_calendar_date(*at)).collect();
+            (matches.len() == 1).then(|| *matches.iter().next().unwrap())
+        };
         // Split subjects must never fall back to AniList's local episode number:
         // for Re:Zero 4th-season Dakkan, Bangumi ep=5 is not AniList ep=5.
         // Prefer the explicit Bangumi `sort` bridge when AniList exposes the
@@ -4530,19 +4569,9 @@ fn bangumi_episode_schedule_with_precision(
         let candidate = if is_split_subject {
             local_and_global
                 .and_then(|(_, global)| precise.get(&global).copied())
-                .or_else(|| {
-                    precise
-                        .values()
-                        .copied()
-                        .find(|timestamp| same_calendar_date(*timestamp))
-                })
+                .or_else(calendar_candidate)
         } else {
-            precise.get(&episode).copied().or_else(|| {
-                precise
-                    .values()
-                    .copied()
-                    .find(|timestamp| same_calendar_date(*timestamp))
-            })
+            precise.get(&episode).copied().or_else(calendar_candidate)
         };
         let Some(candidate) = candidate else {
             continue;
@@ -4564,6 +4593,20 @@ fn bangumi_episode_schedule_with_precision(
         }
     }
     schedule
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn resolved_airing_is_precise(
+    records: &[bangumi::BangumiEpisode],
+    episode_id: i64,
+    airing_at: i64,
+    precise: Option<&HashMap<i64, i64>>,
+) -> bool {
+    records.iter().find(|record| record.id == episode_id)
+        .and_then(|record| record.airdate.as_deref())
+        .and_then(bangumi_episode_timestamp)
+        .is_some_and(|(_, instant)| instant)
+        || precise.is_some_and(|times| times.values().any(|at| *at == airing_at))
 }
 
 /// 将 Bangumi 逐集表应用到 following/tasks。该函数是一次性幂等愈合点：
@@ -4602,9 +4645,11 @@ fn apply_bangumi_episode_records_to_state(
     let tracking = status.is_empty() || status == "doing";
     let next = schedule.iter().find(|(_, _, _, aired)| !*aired).copied();
     let desired_next = next
-        .map(|(episode, _, airing_at, _)| {
+        .map(|(episode, episode_id, airing_at, _)| {
             json!({
                 "episode": episode, "airingAt": airing_at,
+                "episodeId": episode_id,
+                "airingPrecision": if resolved_airing_is_precise(records, episode_id, airing_at, precise) { "instant" } else { "date" },
                 "timeUntilAiring": (airing_at - now).max(0), "source": "bangumi_episode"
             })
         })
@@ -4623,7 +4668,10 @@ fn apply_bangumi_episode_records_to_state(
             value_i64(desired_next.get("episode")),
             value_i64(desired_next.get("airingAt")),
         );
-        if current_key != desired_key {
+        if current_key != desired_key
+            || item["nextAiringEpisode"]["airingPrecision"] != desired_next["airingPrecision"]
+            || item["nextAiringEpisode"]["episodeId"] != desired_next["episodeId"]
+        {
             item["nextAiringEpisode"] = desired_next;
             changed = true;
         }
@@ -4670,7 +4718,8 @@ fn apply_bangumi_episode_records_to_state(
             }
             return true;
         };
-        if !completed && !aired {
+        let instant = resolved_airing_is_precise(records, episode_id, airing_at, precise);
+        if !completed && !aired && (instant || airing_at / 86_400 > now / 86_400) {
             changed = true;
             return false;
         }
@@ -4686,12 +4735,18 @@ fn apply_bangumi_episode_records_to_state(
             task["episodeId"] = json!(episode_id);
             changed = true;
         }
-        if value_i64(task.get("airingAt")) != airing_at {
+        if value_i64(task.get("airingAt")) != airing_at
+            && (instant || value_i64(task.get("airingAt")) <= 0)
+        {
             task["airingAt"] = json!(airing_at);
             changed = true;
         }
         if task.get("airingSource").and_then(Value::as_str) != Some("bangumi_episode") {
             task["airingSource"] = json!("bangumi_episode");
+            changed = true;
+        }
+        if instant && task["airingPrecision"] != "instant" {
+            task["airingPrecision"] = json!("instant");
             changed = true;
         }
         if let Some(object) = task.as_object_mut() {
@@ -4725,7 +4780,8 @@ fn apply_bangumi_episode_records_to_state(
                 "subjectId": subject_id, "episode": episode, "episodeId": episode_id,
                 "episodeSortKey": episode.to_string(), "episodeType": "regular",
                 "animeTitle": title, "coverImage": cover, "airingAt": airing_at,
-                "airingSource": "bangumi_episode", "status": "pending", "createdAt": now,
+                "airingPrecision": if resolved_airing_is_precise(records, *episode_id, *airing_at, precise) { "instant" } else { "date" },
+                "airingSource": "bangumi_episode", "status": "pending", "statusSource": "airing", "createdAt": now,
                 "completedAt": Value::Null, "syncUpdatedAt": now_millis()
             }));
             known.insert(*episode);
@@ -4803,10 +4859,12 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
             continue;
         };
         let desired_next = next
-            .map(|(episode, _, airing_at, _)| {
+            .map(|(episode, episode_id, airing_at, _)| {
                 json!({
                     "episode": episode,
                     "airingAt": airing_at,
+                    "episodeId": episode_id,
+                    "airingPrecision": if resolved_airing_is_precise(&records, episode_id, airing_at, Some(&precise)) { "instant" } else { "date" },
                     "timeUntilAiring": (airing_at - now).max(0),
                     "source": "bangumi_episode"
                 })
@@ -4820,7 +4878,10 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
             value_i64(desired_next.get("episode")),
             value_i64(desired_next.get("airingAt")),
         );
-        if current_key != desired_key {
+        if current_key != desired_key
+            || item["nextAiringEpisode"]["airingPrecision"] != desired_next["airingPrecision"]
+            || item["nextAiringEpisode"]["episodeId"] != desired_next["episodeId"]
+        {
             item["nextAiringEpisode"] = desired_next;
             changed = true;
         }
@@ -4868,7 +4929,10 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 }
                 return true;
             };
-            if value_string(task.get("status")) == "pending" && !aired {
+            let instant = resolved_airing_is_precise(&records, episode_id, airing_at, Some(&precise));
+            if value_string(task.get("status")) == "pending" && !aired
+                && (instant || airing_at / 86_400 > now / 86_400)
+            {
                 changed = true;
                 return false;
             }
@@ -4884,7 +4948,9 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 task["episodeId"] = json!(episode_id);
                 changed = true;
             }
-            if value_i64(task.get("airingAt")) != airing_at {
+            if value_i64(task.get("airingAt")) != airing_at
+                && (instant || value_i64(task.get("airingAt")) <= 0)
+            {
                 task["airingAt"] = json!(airing_at);
                 changed = true;
             }
@@ -4896,6 +4962,10 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 changed = true;
             }
             task["airingSource"] = json!("bangumi_episode");
+            if instant && task["airingPrecision"] != "instant" {
+                task["airingPrecision"] = json!("instant");
+                changed = true;
+            }
             true
         });
         if create_tasks && tracking {
@@ -4920,7 +4990,8 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                     "subjectId": subject_id, "episode": episode, "episodeId": episode_id,
                     "episodeSortKey": episode.to_string(), "episodeType": "regular",
                     "animeTitle": entry_title, "coverImage": entry_cover,
-                    "airingAt": airing_at, "airingSource": "bangumi_episode", "status": "pending",
+                    "airingAt": airing_at, "airingSource": "bangumi_episode", "status": "pending", "statusSource": "airing",
+                    "airingPrecision": if resolved_airing_is_precise(&records, *episode_id, *airing_at, Some(&precise)) { "instant" } else { "date" },
                     "createdAt": now, "completedAt": Value::Null, "syncUpdatedAt": now_millis()
                 });
                 tasks.push(task);
@@ -5287,6 +5358,7 @@ fn apply_anilist_authority_media_inner(
                     "episode": episode,
                     "airingAt": airing_at,
                     "status": "pending",
+                    "statusSource": "airing",
                     "createdAt": now,
                     "completedAt": Value::Null,
                     "syncUpdatedAt": sync_updated_at,
@@ -5312,8 +5384,8 @@ fn apply_anilist_authority_media_inner(
 /// （std MutexGuard 绝不能跨 await——Tauri 命令 future 必须 Send），抓取成功即
 /// 落缓存（第 8 轮问题 1 止血：供 perform_webdav_sync 云端合并后免网络套用），
 /// 再持锁应用（持锁段内无 await）。失败（网络/解析/锁）静默 false。state 为
-/// 共享状态锁本体，await 只发生在抓取段。Android 无此路径（最小对齐走
-/// reconcile_unaired_anilist_next_tasks，完整 schedule 纠偏留 Java Worker 后续）。
+/// 共享状态锁本体，await 只发生在抓取段。
+/// Android applies its per-subject episode schedule through the native snapshot.
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 async fn anilist_authority_refresh(
     state: &Mutex<Value>,
@@ -6587,7 +6659,9 @@ mod bangumi_sync {
     /// 进度推送候选任务（验收第 4 轮问题 2 抽取）：completed、非拉取来源
     /// （lastChangedBy != bangumi，防循环）、未推送过（无 lastPushedToBangumiAt）。
     fn push_candidate_task(task: &Value) -> bool {
-        value_string(task.get("status")) == "completed"
+        (value_string(task.get("status")) == "completed"
+            || (value_string(task.get("status")) == "pending"
+                && value_string(task.get("lastChangedBy")) == "local"))
             && task.get("lastChangedBy").and_then(Value::as_str) != Some("bangumi")
             && !task
                 .get("lastPushedToBangumiAt")
@@ -6676,11 +6750,12 @@ mod bangumi_sync {
             create: bool,
             h_local: String,
         }
-        let (following_snapshot, deleted_snapshot) = {
+        let (following_snapshot, deleted_snapshot, task_snapshot) = {
             let guard = state.lock().expect("state lock");
             (
                 guard["following"].as_array().cloned().unwrap_or_default(),
                 guard["syncMetadata"]["followingDeletedAt"].clone(),
+                guard["tasks"].as_array().cloned().unwrap_or_default(),
             )
         };
         let snapshot_tombstone = |subject_id: i64| -> bool {
@@ -6728,7 +6803,14 @@ mod bangumi_sync {
                 continue;
             };
             // 远端无变化（payload hash 相同）→ 跳过。
+            let has_local_progress = task_snapshot.iter().any(|task|
+                value_i64(task.get("subjectId")) == subject_id
+                    && value_string(task.get("lastChangedBy")) == "local"
+                    && push_candidate_task(task));
+            let progress_matches = collection.ep_status.is_none_or(|progress|
+                entry.get("watchedEpisode").and_then(Value::as_i64) == Some(i64::from(progress)));
             if entry.get("lastPulledPayloadHash").and_then(Value::as_str) == Some(h_remote.as_str())
+                && (progress_matches || has_local_progress)
             {
                 continue;
             }
@@ -6918,6 +7000,7 @@ mod bangumi_sync {
                         && value_i64(task.get("episode")) <= ep_status
                     {
                         task["status"] = json!("completed");
+                        task["statusSource"] = json!("bangumi");
                         task["completedAt"] = json!(now);
                         task["syncUpdatedAt"] = json!(now_millis());
                         task["lastChangedBy"] = json!("bangumi");
@@ -6948,6 +7031,10 @@ mod bangumi_sync {
         } else {
             None
         };
+        let has_local_progress = state["tasks"].as_array().into_iter().flatten().any(|task|
+            value_i64(task.get("subjectId")) == collection.subject_id
+                && value_string(task.get("lastChangedBy")) == "local"
+                && push_candidate_task(task));
         let Some(entry) = state["following"]
             .as_array_mut()
             .and_then(|items| items.get_mut(entry_index))
@@ -6957,11 +7044,10 @@ mod bangumi_sync {
         if let Some(status) = bangumi::collection_status_name(collection.collection_type) {
             entry["bangumiStatus"] = json!(status);
         }
-        if collection.collection_type == bangumi::SubjectCollectionType::Done.as_u32() {
-            entry["watchedEpisode"] = collection
-                .ep_status
-                .map(|value| json!(i64::from(value)))
-                .unwrap_or(Value::Null);
+        if !has_local_progress {
+            if let Some(progress) = collection.ep_status {
+                entry["watchedEpisode"] = json!(i64::from(progress));
+            }
         }
         if let Some(rate) = collection.rate {
             entry["rating"] = json!(rate);
@@ -7305,9 +7391,9 @@ mod bangumi_sync {
                     });
                 }
             }
-            let mut episode_batches: Vec<(i64, Vec<i64>)> = Vec::new();
+            let mut episode_batches: Vec<((i64, bool), Vec<i64>)> = Vec::new();
             if settings.push_completed_episodes {
-                let mut grouped: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+                let mut grouped: BTreeMap<(i64, bool), Vec<i64>> = BTreeMap::new();
                 for task in guard["tasks"].as_array().into_iter().flatten() {
                     if !push_candidate_task(task) {
                         continue;
@@ -7323,7 +7409,8 @@ mod bangumi_sync {
                     let (Some(subject_id), Some(episode_id)) = (subject_id, episode_id) else {
                         continue;
                     };
-                    grouped.entry(subject_id).or_default().push(episode_id);
+                    grouped.entry((subject_id, value_string(task.get("status")) == "completed"))
+                        .or_default().push(episode_id);
                 }
                 episode_batches = grouped.into_iter().collect();
             }
@@ -7398,19 +7485,19 @@ mod bangumi_sync {
                     .push(super::bangumi_commands::request_error_message(error)),
             }
         }
-        let mut done_batches: Vec<(i64, Vec<i64>)> = Vec::new();
-        for (subject_id, episode_ids) in episode_batches {
+        let mut done_batches: Vec<((i64, bool), Vec<i64>)> = Vec::new();
+        for ((subject_id, completed), episode_ids) in episode_batches {
             match http
                 .update_episode_progress_batch(
                     &token,
                     subject_id,
                     &episode_ids,
-                    bangumi::EpisodeCollectionType::Watched,
+                    if completed { bangumi::EpisodeCollectionType::Watched } else { bangumi::EpisodeCollectionType::NotCollected },
                 )
                 .await
             {
                 Ok(()) => {
-                    done_batches.push((subject_id, episode_ids));
+                    done_batches.push(((subject_id, completed), episode_ids));
                     report.pushed += 1;
                 }
                 Err(error) => report
@@ -7434,10 +7521,11 @@ mod bangumi_sync {
                     guard["following"][index]["lastPushedToBangumiAt"] = json!(now_seconds());
                 }
             }
-            for (subject_id, episode_ids) in done_batches {
+            for ((subject_id, completed), episode_ids) in done_batches {
                 if let Some(tasks) = guard["tasks"].as_array_mut() {
                     for task in tasks.iter_mut() {
                         if value_i64(task.get("subjectId")) == subject_id
+                            && (value_string(task.get("status")) == "completed") == completed
                             && task
                                 .get("episodeId")
                                 .and_then(Value::as_i64)
@@ -9637,8 +9725,8 @@ pub fn run() {
             #[cfg(target_os = "android")]
             {
                 mobile::import_legacy_state(app.handle(), &context)?;
-                mobile::configure(app.handle(), &context)?;
                 mobile::consume_events(app.handle(), &context)?;
+                mobile::configure(app.handle(), &context)?;
             }
             // Phase 4 任务 1：Android 前台过期同步补偿（setup 完成后异步执行，
             // 仅 standard edition；Windows 桌面启动路径零变化）。
@@ -12179,7 +12267,7 @@ mod tests {
         assert_eq!(doing["bangumiStatus"], "doing");
         assert_eq!(doing["rating"], 8);
         assert_eq!(doing["lastChangedBy"], "bangumi");
-        assert!(doing.get("watchedEpisode").is_none_or(Value::is_null));
+        assert_eq!(doing["watchedEpisode"], 3);
         // dropped：取消追番（条目删除、未完成删、已完成保留、墓碑写入）。
         assert!(entry(99999).is_none());
         let tasks = guard["tasks"].as_array().unwrap();
@@ -13002,17 +13090,13 @@ mod tests {
 
     #[cfg(feature = "standard")]
     #[test]
-    fn reconcile_purges_eps_overflow_and_secondary_claimant_pending_tasks() {
-        // 存量清理：a) 丧失篇 547888（eps=11）的 pending ep15（离线调度越过
-        // eps 生成）删除；b) 共享 anilistId 189046 的非主条目 633836 的 pending
-        // 删除（防 547888-12..15 与 633836-12..15 这类同集双份）；completed
-        // 观看历史一律保留。幂等。
+    fn reconcile_purges_overflow_but_keeps_each_split_subjects_tasks() {
         let mut state = default_state(false);
         state["following"] = json!([
             {"id": 547888, "source": "bangumi", "anilistId": 189046, "bangumiId": 547888,
              "displayTitle": "丧失篇", "episodes": 11, "followedAt": 1_000, "syncUpdatedAt": 1},
             {"id": 633836, "source": "bangumi", "anilistId": 189046, "bangumiId": 633836,
-             "displayTitle": "夺还篇", "episodes": 12, "followedAt": 2_000, "syncUpdatedAt": 1}
+             "displayTitle": "夺还篇", "episodes": 8, "followedAt": 2_000, "syncUpdatedAt": 1}
         ]);
         let past = now_seconds() - 3_600;
         state["tasks"] = json!([
@@ -13022,8 +13106,9 @@ mod tests {
             // 主条目、eps 内 pending → 保留。
             {"id": "547888-10", "animeId": 547888, "episode": 10, "airingAt": past,
              "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
-            // b) 非主条目 pending → 删除（即使 episode <= eps）。
-            {"id": "633836-12", "animeId": 633836, "episode": 12, "airingAt": past,
+            // This is a different subject's episode, not a duplicate.
+            {"id": "633836-5", "animeId": 633836, "subjectId": 633836,
+             "episodeId": 1656862, "episode": 5, "airingAt": past,
              "status": "pending", "createdAt": 1, "completedAt": Value::Null, "syncUpdatedAt": 1},
             // completed 历史 → 永不删除（两个条目各保留一条）。
             {"id": "633836-9", "animeId": 633836, "episode": 9, "airingAt": past,
@@ -13040,7 +13125,7 @@ mod tests {
             .iter()
             .map(|task| value_string(task.get("id")))
             .collect();
-        assert_eq!(ids, vec!["547888-10", "633836-9", "547888-9"]);
+        assert_eq!(ids, vec!["547888-10", "633836-5", "633836-9", "547888-9"]);
 
         // 幂等：再次 reconcile 任务集不再变化。
         let before = state["tasks"].clone();
@@ -13960,7 +14045,7 @@ mod tests {
 
     #[cfg(feature = "standard")]
     #[test]
-    fn desktop_reconcile_keeps_aired_task_under_polluted_next_android_fn_still_drops() {
+    fn reconcile_keeps_aired_task_under_polluted_next() {
         // 第 6 轮误删事故回归（100女友 598058, anilistId=200637）：桌面条目的
         // nextAiringEpisode 曾被离线锚点污染（next=ep10@9/9），而 ep10 已于
         // 9/6 21:30 真实播出——旧版 reconcile_following_entries 按
@@ -13968,9 +14053,7 @@ mod tests {
         // AIRING_QUERY 窗口永不重建。修复后：
         // a) 桌面 reconcile（覆盖加载/WebDAV 合并路径）不再做此无网络清理，
         //    已播任务保留且零变更；
-        // b) Android 语义（纯函数层，mobile merge_status 同口径）：next=ep10
-        //    时 pending ep10 仍按契约删除（Java 提供的 next 与条目同源，无
-        //    离线锚点污染路径），completed 不动，幂等。
+        // Android snapshot reconciliation has separate per-episode tests.
         let mut state = default_state(false);
         state["following"] = json!([{
             "id": 598058, "source": "bangumi", "anilistId": 200637, "bangumiId": 598058,
@@ -14002,17 +14085,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["598058-10", "598058-9"]);
 
-        // b) Android 语义（纯函数层）：pending >= next 删除，completed 保留。
-        assert!(reconcile_unaired_anilist_next_tasks(&mut state));
-        let ids: Vec<String> = state["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|task| value_string(task.get("id")))
-            .collect();
-        assert_eq!(ids, vec!["598058-9"]);
-        // 幂等。
-        assert!(!reconcile_unaired_anilist_next_tasks(&mut state));
+        assert!(!reconcile_following_entries(&mut state, &map, false));
     }
 
     // -- 权威数据修复 2：跨键身份按 subject 锚定（夺还篇重追）------------------
@@ -15527,14 +15600,14 @@ mod tests {
         assert!(toggle_task_status(&mut null_subject));
         assert!(null_subject.get("lastChangedBy").is_none());
 
-        // 取消完成（completed → pending）：不置 local。
+        // Undo is a new local progress change and must be eligible for upload.
         let mut uncomplete = json!({
             "id": "140001-5", "subjectId": 140001, "status": "completed",
             "lastChangedBy": "bangumi"
         });
         assert!(!toggle_task_status(&mut uncomplete));
         assert_eq!(uncomplete["status"], "pending");
-        assert_eq!(uncomplete["lastChangedBy"], "bangumi");
+        assert_eq!(uncomplete["lastChangedBy"], "local");
         assert!(uncomplete["completedAt"].is_null());
     }
 

@@ -34,87 +34,17 @@ pub fn init() -> TauriPlugin<Wry, ()> {
 
 fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
     let state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
-    let following = state["following"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|item| {
-            // Phase 2 主键迁移 additive 字段（source/subjectId/anilistId）：
-            // MobileStore.java 按需 opt* 取键，未知键无害（schema §10）。
-            // 缺省 source 视为 anilist；bangumi 条目 id 即 subjectId，
-            // anilistId 为 AniList 关联；anilist 条目反之。
-            let source = {
-                let value = value_string(item.get("source"));
-                if value.is_empty() {
-                    "anilist".to_string()
-                } else {
-                    value
-                }
-            };
-            let id = value_i64(item.get("id"));
-            let bangumi = source == "bangumi";
-            let subject_id = if bangumi {
-                id
-            } else {
-                value_i64(item.get("subjectId"))
-            };
-            let anilist_id = if bangumi {
-                value_i64(item.get("anilistId"))
-            } else {
-                id
-            };
-            json!({
-                "id": id,
-                "displayTitle": value_string(item.get("displayTitle")),
-                "coverImage": value_string(item.get("coverImage")),
-                "nextEpisode": value_i64(item["nextAiringEpisode"].get("episode")),
-                "nextAiringAt": value_i64(item["nextAiringEpisode"].get("airingAt")),
-                "source": source,
-                "subjectId": if subject_id > 0 { json!(subject_id) } else { Value::Null },
-                "anilistId": if anilist_id > 0 { json!(anilist_id) } else { Value::Null },
-                "bangumiStatus": item.get("bangumiStatus").cloned().unwrap_or(Value::Null),
-                "followedAt": value_i64(item.get("followedAt")),
-                "syncUpdatedAt": value_i64(item.get("syncUpdatedAt")),
-                "lastChangedBy": item.get("lastChangedBy").cloned().unwrap_or(Value::Null),
-                "localFollowIntentAt": value_i64(item.get("localFollowIntentAt")),
-                "watchedEpisode": item.get("watchedEpisode").cloned().unwrap_or(Value::Null)
-            })
-        })
-        .collect::<Vec<_>>();
-    // Android 后台 Worker 也负责坚果云三字段投影；必须传递完整任务历史，
-    // 而不只是 pending。否则 Worker 合并后会把已完成观看记录误删出云端。
-    let tasks = state["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|task| {
-            json!({
-                "id": value_string(task.get("id")),
-                "animeTitle": value_string(task.get("animeTitle")),
-                "episode": value_i64(task.get("episode")),
-                "airingAt": value_i64(task.get("airingAt")),
-                "animeId": value_i64(task.get("animeId")),
-                "subjectId": if value_i64(task.get("subjectId")) > 0 { json!(value_i64(task.get("subjectId"))) } else { Value::Null },
-                "episodeId": if value_i64(task.get("episodeId")) > 0 { json!(value_i64(task.get("episodeId"))) } else { Value::Null },
-                "status": value_string(task.get("status"))
-            })
-        })
-        .collect::<Vec<_>>();
-    let settings = &state["settings"];
-    Ok(json!({
-        "following": following,
-        "pendingTasks": tasks,
-        "notificationsEnabled": value_bool(settings.get("notifyWhenAired")),
-        "createTasksEnabled": value_bool(settings.get("createWatchTasks")),
-        "dailyTaskReminderEnabled": value_bool(settings.get("dailyTaskReminderEnabled")),
-        "dailyTaskReminderTime": value_string(settings.get("dailyTaskReminderTime")),
-        "uiLanguage": value_string(settings.get("uiLanguage"))
-    }))
+    Ok(super::mobile_state::configuration_payload(
+        &state,
+        context.original,
+    ))
 }
 
 pub fn configure(app: &AppHandle, context: &AppContext) -> anyhow::Result<Value> {
     let bridge = app.state::<MobileBridge>();
-    bridge.run("configure", configuration_payload(context)?)
+    let status = bridge.run("configure", configuration_payload(context)?)?;
+    merge_status(app, context, &status)?;
+    Ok(status)
 }
 
 fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow::Result<usize> {
@@ -128,205 +58,7 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
     }
     let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
     let before = serde_json::to_string(&*state)?;
-    // 权威数据修复（共享 anilistId 去重，Android 侧与 lib.rs 同口径）：同一
-    // anilistId 被多个 following 条目认领（分季课程共占一个 AniList 条目）时，
-    // 只有主条目（anilistIndex 指向者优先，否则 followedAt 最早者）接受
-    // nextAiringEpisode 写回与新集任务；非主条目跳过，避免同集任务在两个
-    // 条目下重复生成。
-    #[cfg(feature = "standard")]
-    let secondary_claimants =
-        super::secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
-    #[cfg(not(feature = "standard"))]
-    let secondary_claimants: HashSet<i64> = HashSet::new();
-
-    if let Some(schedules) = status.get("following").and_then(Value::as_array) {
-        for schedule in schedules {
-            let anime_id = value_i64(schedule.get("id"));
-            if secondary_claimants.contains(&anime_id) {
-                continue;
-            }
-            if let Some(followed) = state["following"].as_array_mut().and_then(|items| {
-                items
-                    .iter_mut()
-                    .find(|item| value_i64(item.get("id")) == anime_id)
-            }) {
-                let episode = value_i64(schedule.get("nextEpisode"));
-                let airing_at = value_i64(schedule.get("nextAiringAt"));
-                followed["nextAiringEpisode"] = if episode > 0 && airing_at > 0 {
-                    json!({"episode": episode, "airingAt": airing_at})
-                } else {
-                    Value::Null
-                };
-                let cover = value_string(schedule.get("coverImage"));
-                if !cover.is_empty() {
-                    followed["coverImage"] = json!(cover);
-                }
-            }
-        }
-    }
-
-    let create_tasks = value_bool(state["settings"].get("createWatchTasks"));
-    let mut created = 0;
-    if create_tasks {
-        let mut known: HashSet<String> = state["tasks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|task| value_string(task.get("id")))
-            .collect();
-        let followed_ids: HashSet<i64> = state["following"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|item| value_i64(item.get("id")))
-            .collect();
-        // 问题 3 同款守卫（Android 原生 aired 事件建任务）：旧版完成的任务挂
-        // anilistId 键（"21355-5"），bangumi 条目新事件按 subjectId 建任务
-        // （"140001-5"），仅按任务 id 查重查不到 → 同一集重复 pending。建任务
-        // 前按"已完成集合"（与 lib.rs apply_airing_schedules 同判定口径）再
-        // 拦一层：命中即视为该集已有观看历史。
-        #[cfg(feature = "standard")]
-        let completed_history = super::completed_episode_history(&state["tasks"]);
-        for event in status
-            .get("events")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = value_string(event.get("id"));
-            let anime_id = value_i64(event.get("animeId"));
-            let episode = value_i64(event.get("episode"));
-            if id.is_empty()
-                || anime_id <= 0
-                || episode <= 0
-                || known.contains(&id)
-                || !followed_ids.contains(&anime_id)
-                || secondary_claimants.contains(&anime_id)
-            {
-                continue;
-            }
-            // 状态驱动追踪（任务 2 门控，Android 侧）：条目 `bangumiStatus`
-            // 非空且非 doing（wish/on_hold/done）→ 收录不追踪，不为新集创建
-            // 观看任务（播出通知不受影响，Java 层照发）。anilist 条目
-            // （bangumiStatus 为 null）与 original 不受影响。
-            #[cfg(feature = "standard")]
-            if state["following"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|item| {
-                    value_i64(item.get("id")) == anime_id
-                        && super::bangumi_status_blocks_tracking(&value_string(
-                            item.get("bangumiStatus"),
-                        ))
-                })
-            {
-                continue;
-            }
-            // 已完成历史查重（standard）：定位事件对应条目（id 或 anilistId
-            // 匹配，与 apply_airing_schedules 同口径），bangumi 条目命中
-            // (subjectId, episode) 或 (anilistId, episode) → 该集已有观看
-            // 历史，跳过创建。anilist 键条目不经过此守卫（其任务 id 查重本
-            // 就覆盖 completed）；与上方 known id 查重并存（两层防护）。
-            #[cfg(feature = "standard")]
-            {
-                let followed = state["following"].as_array().and_then(|items| {
-                    items.iter().find(|item| {
-                        value_i64(item.get("id")) == anime_id
-                            || (value_string(item.get("source")) == "bangumi"
-                                && value_i64(item.get("anilistId")) == anime_id)
-                    })
-                });
-                let bangumi_sourced =
-                    followed.is_some_and(|item| value_string(item.get("source")) == "bangumi");
-                if bangumi_sourced {
-                    let task_anime_id = followed
-                        .map(|item| value_i64(item.get("id")))
-                        .unwrap_or(anime_id);
-                    let anilist_id = followed
-                        .map(|item| value_i64(item.get("anilistId")))
-                        .unwrap_or(0);
-                    if super::completed_history_blocks_event(
-                        &completed_history,
-                        task_anime_id,
-                        anilist_id,
-                        episode,
-                    ) {
-                        continue;
-                    }
-                }
-            }
-            let title = state["following"]
-                .as_array()
-                .and_then(|items| {
-                    items
-                        .iter()
-                        .find(|item| value_i64(item.get("id")) == anime_id)
-                })
-                .map(|item| value_string(item.get("displayTitle")))
-                .unwrap_or_else(|| value_string(event.get("animeTitle")));
-            let event_created_at = value_i64(event.get("createdAt"));
-            let created_at = if event_created_at > 0 {
-                event_created_at
-            } else {
-                now_seconds()
-            };
-            #[cfg_attr(not(feature = "standard"), expect(unused_mut))]
-            let mut new_task = json!({
-                "id": id,
-                "animeId": anime_id,
-                "animeTitle": title,
-                "coverImage": value_string(event.get("coverImage")),
-                "episode": episode,
-                "airingAt": value_i64(event.get("airingAt")),
-                "status": "pending",
-                "createdAt": created_at,
-                "completedAt": null,
-                "syncUpdatedAt": now_millis()
-            });
-            // Phase 2 additive 任务字段（standard 写入，original 行为不变）；
-            // animeId 已与 following 载荷 id 一致（bangumi 条目即 subjectId）。
-            #[cfg(feature = "standard")]
-            {
-                let subject_sourced = state["following"].as_array().is_some_and(|items| {
-                    items.iter().any(|item| {
-                        value_i64(item.get("id")) == anime_id
-                            && value_string(item.get("source")) == "bangumi"
-                    })
-                });
-                new_task["subjectId"] = if subject_sourced {
-                    json!(anime_id)
-                } else {
-                    Value::Null
-                };
-                new_task["episodeId"] = Value::Null;
-                new_task["episodeSortKey"] = json!(episode.to_string());
-                new_task["episodeType"] = json!("regular");
-            }
-            state["tasks"].as_array_mut().unwrap().push(new_task);
-            known.insert(id);
-            created += 1;
-        }
-    }
-
-    // 权威数据修复（Android 专属最小对齐，缺口 2；mobile.rs 仅
-    // target_os="android" 编译，cfg 双重显式门控）：Java 数据（含其提供的
-    // nextEpisode/nextAiringAt）合并完、事件任务建完后，用本地 next 值做无
-    // 网络任务纠偏——pending episode >= next.episode 即未播假票，无论
-    // airingAt 过去/未来都删除，与 lib.rs reconcile_following_entries 同口径
-    // （completed 观看历史一律保留）。第 6 轮误删事故后桌面已撤销该清理
-    // （桌面条目 next 可能被离线锚点污染，曾误删真实已播任务；桌面改由
-    // anilist_authority_refresh 的权威 schedule 承担纠偏 + 回填）；Android
-    // 侧 next 由 Java Worker 从 AniList 拉取、与 Rust 条目同源，无离线锚点
-    // 污染路径，保留。完整 schedule 纠偏（逐集 airingAt 改写 + next 权威
-    // 重写）留 Java Worker 后续接入。
-    #[cfg(all(feature = "standard", target_os = "android"))]
-    super::reconcile_unaired_anilist_next_tasks(&mut state);
-
-    let synced_at = value_i64(status.get("syncedAt"));
-    if synced_at > value_i64(state.get("lastSyncAt")) {
-        state["lastSyncAt"] = json!(synced_at);
-    }
+    let created = super::mobile_state::merge_snapshot(&mut state, status, now_seconds())?;
     state["tasks"]
         .as_array_mut()
         .unwrap()
@@ -585,7 +317,7 @@ pub fn sync_webdav(app: &AppHandle, context: &AppContext) -> anyhow::Result<Valu
             } else {
                 None
             };
-            let (merged, remote_changed) = {
+            let (mut merged, mut remote_changed) = {
                 let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
                 if let Some(remote) = &remote {
                     let (changed, merged, remote_changed) =
@@ -619,6 +351,16 @@ pub fn sync_webdav(app: &AppHandle, context: &AppContext) -> anyhow::Result<Valu
                 context.save_state()?;
                 emit_state(app, context);
                 configure(app, context)?;
+                // Native reconciliation may have removed a premature task or
+                // recovered a durable background completion. Upload that state.
+                let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
+                merged = document_from_state(&mut state);
+                remote_changed = remote
+                    .as_ref()
+                    .map(|document| {
+                        comparable_document(document).ok() != comparable_document(&merged).ok()
+                    })
+                    .unwrap_or(true);
             }
             if !remote_changed
                 || remote.as_ref().is_some_and(|document| {

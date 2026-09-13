@@ -18,6 +18,34 @@ import org.junit.Test;
  * completed 保留；外加 5 MB 拒绝与 version 拒绝。
  */
 public class SyncMergeTest {
+    @Test
+    public void schedulesNeverCrossWebDavButAreRestoredLocally() throws Exception {
+        JSONObject original = followed(1, 1000).put("nextEpisode", 6).put("nextAiringAt", 5000)
+            .put("nextAiringPrecision", "instant").put("scheduleUpdatedAt", 3000)
+            .put("episodeSchedule", new JSONArray().put(new JSONObject().put("episode", 6)));
+        JSONObject local = doc(array(original), array(task("1-1", 1, "completed", 4000)), null);
+        JSONObject remote = doc(array(followed(1, 2000).put("nextEpisode", 99).put("nextAiringAt", 1)),
+            array(task("1-1", 1, "pending", 2000)), null);
+        SyncMerge.Result result = SyncMerge.merge(local, remote);
+        JSONObject merged = result.merged.getJSONArray("following").getJSONObject(0);
+        for (String key : SyncMerge.LOCAL_SCHEDULE_KEYS) assertFalse(merged.has(key));
+        assertEquals("completed", result.merged.getJSONArray("tasks").getJSONObject(0).getString("status"));
+        SyncMerge.restoreLocalSchedules(result.merged.getJSONArray("following"), local.getJSONArray("following"));
+        assertEquals(6, merged.getInt("nextEpisode"));
+        assertEquals(3000, merged.getLong("scheduleUpdatedAt"));
+        assertEquals(6, original.getInt("nextEpisode"));
+        assertFalse(SyncMerge.normalizeDocument(result.merged).getJSONArray("following").getJSONObject(0).has("episodeSchedule"));
+    }
+
+    @Test
+    public void regeneratedPendingNeverUndoesAWatchButManualUndoStillWins() throws Exception {
+        JSONObject completed = task("1-1", 1, "completed", 1000);
+        JSONObject regenerated = task("1-1", 1, "pending", 9000).put("statusSource", "airing");
+        assertSame(completed, SyncMerge.chooseRecord(completed, regenerated, "createdAt"));
+        assertSame(completed, SyncMerge.chooseRecord(regenerated, completed, "createdAt"));
+        regenerated.put("statusSource", "local");
+        assertSame(regenerated, SyncMerge.chooseRecord(completed, regenerated, "createdAt"));
+    }
 
     private static JSONObject followed(long id, long syncUpdatedAt) throws Exception {
         JSONObject item = new JSONObject();

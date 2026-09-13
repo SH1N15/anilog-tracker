@@ -1,8 +1,8 @@
 # AniLog 标准版 Bangumi 迁移 — Schema 冻结文档（Phase 0）
 
 > 分支：`codex/bangumi-standard-migration`
-> 状态：Phase 0 历史契约；当前 v0.7.2 修复线对播出权威的补充约束见 §6。
-> 配套（本机）进度锚点：`LOCAL_MIGRATION_PROGRESS.md`（契约基准，本文档不得与之冲突）；产品方案：`LOCAL_BANGUMI_STANDARD_MIGRATION_PLAN.md`。
+> 状态：Phase 0 历史契约；v0.7.2 的播出权威修正见 §6，v0.7.4 的任务/桥接/精度补充见 §13。
+> 配套（本机历史资料）：`LOCAL_MIGRATION_PROGRESS.md`、`LOCAL_BANGUMI_STANDARD_MIGRATION_PLAN.md`。当前行为以维护交接、§13 及源码为准，历史进度中的旧方案不能覆盖已发布修复。
 
 ## 1. 文档目的与范围
 
@@ -373,6 +373,15 @@ bangumi-data（npm 包 0.3.215）字段：`begin`(ISO 含秒)、`broadcast`(RFC5
 
 ---
 
+## 13. v0.7.4 补充契约
+
+- 当前本地状态版本为 `3`，WebDAV 文档版本仍为 `1`；Phase 0 的 v2 表格只记录迁移起点。
+- 同一个 AniList media 可对应多个 Bangumi 分篇，各自持有本地 `ep` / `episodeId`；不得据共享 AniList ID 删除分篇任务。
+- 日期级日程不能当作午夜的精确播出时刻；精确缓存不可因重复读取而延长有效期。
+- 原生前后台传递完整业务记录和时间戳，Android 启动先合并持久快照，再配置后台。
+- 派生日程字段只留本机；自动生成的 `statusSource=airing` 待看记录不能覆盖已完成记录，用户手动撤销仍按记录时间戳合并。
+- 完成/撤销即时更新进度，Bangumi “在看”收藏也读取进度。完整可执行契约与测试入口见 [WATCH_STATE_REGRESSIONS.md](WATCH_STATE_REGRESSIONS.md)。
+
 ## 冻结声明
 
 本文件在 **Phase 0 冻结**，作为 AniLog 标准版 Bangumi 迁移的跨层 schema 契约基准。任何后续阶段（Phase 1-5）对本契约的改动，必须在下方"变更记录"追加变更行（日期 + 阶段 + 变更摘要 + 影响的章节），并同步更新 `LOCAL_MIGRATION_PROGRESS.md` 的对应接口契约小节。文档为公开可提交文件，**不得写入任何凭据、Token、签名材料或真实用户数据**；端点表只列已确认项，不做未验证的端点猜测。
@@ -383,3 +392,4 @@ bangumi-data（npm 包 0.3.215）字段：`begin`(ISO 含秒)、`broadcast`(RFC5
 |---|---|---|---|
 | 2026-09-06 | Phase 0 | 初版冻结 | 全部 |
 | 2026-09-06 | Phase 0 | 按官方 v0.yaml 修正集数端点/收藏枚举(2=Done,3=Doing)/单条收藏复数路径/写操作 `-` 路径与 ep_status 书籍限制 | §5 |
+| 2026-09-13 | v0.7.4 | 明确历史 v2 与当前 v3 的边界；补充分篇身份、时间精度、完整原生快照、自动任务合并与进度契约 | §13 |

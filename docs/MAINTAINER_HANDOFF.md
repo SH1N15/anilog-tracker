@@ -2,7 +2,7 @@
 
 本文档面向后续维护者和 AI，记录项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
-> `v0.7.3` 已正式发布：在 `v0.7.2` 的 Bangumi 逐集播出权威基础上，修复 Android 季度缓存重启后失效、过期缓存阻塞首屏，以及窄屏详情页横向溢出。Standard 的逐集身份/`episodeId` 权威仍为 Bangumi `/v0/episodes`；AniList 只在确认同一集后提供分钟级时间。AniList 暂时 403 时不得用 `bangumi-data` 的周播锚点猜测后续集数；系统降级为最近一次可信 AniList 时间或日期级时间，恢复后自动纠偏。WebDAV 合并后必须用本地 Bangumi episode 缓存再愈合一次。
+> `v0.7.4` 正式版修复 Android 待看任务消失、提前提醒、更新时间跳变、观看进度不同步和手机进度竖排。维护者于 2026-09-13 确认 `v0.7.4-rc.1` 测试通过并授权正式发布；正式包使用 `versionCode=13` 重新构建，不把 rc 安装包改名冒充正式包。Standard 仍由 Bangumi 确认逐集身份，AniList 只补充已匹配集数的精确时间；日期占位不得用于精确提醒。
 
 ## 1. 项目现状
 
@@ -10,9 +10,9 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
-- 正式版：`v0.7.3`，GitHub Latest
-- 当前开发基线：`v0.7.3`
-- Android `versionCode`：`11`（仅 `arm64-v8a`）
+- 正式版：`v0.7.4`，GitHub Latest
+- 当前开发基线：`v0.7.4`
+- Android `versionCode`：`13`（上一正式版 `v0.7.3` 为 `11`，本地验收版 `v0.7.4-rc.1` 为 `12`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 
 Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。
@@ -24,8 +24,11 @@ Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capac
 | `src/` | React 共享界面、类型、国际化和平台适配入口 | 现行 |
 | `src/platform/tauri.ts` | 前端调用 Tauri command 的接口层 | 现行 |
 | `src-tauri/src/lib.rs` | Rust 共享核心：状态、AniList、季度缓存、追番、任务、中文标题、WebDAV、Windows 生命周期 | 现行 |
+| `src-tauri/src/bangumi.rs` | Bangumi API、数据模型、映射和 Token 存储契约 | Standard |
 | `src-tauri/src/mobile.rs` | Rust 到 Android 原生插件的桥接 | 现行 |
+| `src-tauri/src/mobile_state.rs` | 完整原生快照合并、设备日程与任务历史保护 | 现行 |
 | `src-tauri/gen/android/` | Tauri Android 工程；AlarmManager、WorkManager、通知、Keystore、WebDAV 传输 | 现行 |
+| `src-tauri/gen/android/app/src/main/java/io/anilog/android/EpisodeSchedule.java` | 可单测的逐集身份、时间精度和任务纠偏 | Standard |
 | `electron/` | v0.5 Windows Electron 实现 | 稳定版回退，保留 |
 | `android/` | v0.5 Android Capacitor 实现 | 稳定版回退，保留 |
 | `scripts/` | 构建和行为回归脚本 | 共用 |
@@ -49,7 +52,9 @@ Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capac
 
 `standard` 和 `original` 不能同时启用。Original 必须在 Rust、前端和 Android 三层阻断 Bangumi 请求，不能只隐藏界面入口。
 
-标准版的中文标题来源依次包含 `bangumi-data` 精简本地映射和 Bangumi API/反代。默认反代为 `https://sh1n.cc.cd/v0`，这是项目维护者自建服务。请求串行执行，间隔至少 450 ms；失败后暂停 10 分钟。成功标题缓存 180 天，未来作品未匹配缓存 1 天，已播作品未匹配缓存 7 天。没有可靠中文名的候选应过滤，不要用机器直译伪造正式标题。
+标准版以 Bangumi 为季度条目和逐集身份的主数据源，`bangumi-data` 用于离线映射和元数据，AniList 补充匹配集数的精确时间。默认反代为 `https://sh1n.cc.cd/v0`，这是项目维护者自建服务。旧标题解析链仍保留，其请求串行执行、间隔至少 450 ms，整体不可用时暂停 10 分钟；这些参数不能泛化到所有 Bangumi API 请求。成功标题缓存 180 天，未来作品未匹配缓存 1 天，已播作品未匹配缓存 7 天。没有可靠中文名的候选应过滤，不要用机器直译伪造正式标题。
+
+Bangumi Token 存于系统安全存储；配置反代后，认证请求会经反代发送，维护文档不能声称反代永远看不到 Token。不要把 Token 输出到状态、日志或文档。
 
 注意：`src-tauri/tauri.android-original.conf.json` 中可能仍显示标准标识符。Android Original 的实际 application ID 由 `ANILOG_ANDROID_EDITION=original` 在 `src-tauri/gen/android/app/build.gradle.kts` 中切换，不能只根据 Tauri JSON 判断。
 
@@ -65,6 +70,14 @@ Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capac
 - 用户手动完成/恢复任务和跨端合并都要维护记录的更新时间。
 
 改动追番删除或任务生成逻辑后，至少运行任务保留、状态刷新、WebDAV 合并相关测试，并人工验证“完成任务保留、未完成任务删除、刷新不重复”。
+
+`v0.7.4` 的执行契约和回归入口见 [`WATCH_STATE_REGRESSIONS.md`](WATCH_STATE_REGRESSIONS.md)：
+
+- 共用 AniList ID 的 Bangumi 分篇按各自 subject/episode 保留任务，不按“主认领条目”一刀切删除。
+- 日期级数据区分过去日期、今天时刻未知、未来日期；不得仅凭 `episode >= nextEpisode` 删除合法已播任务。
+- Android 启动先读取持久原生快照，再配置后台；桥接传递完整任务和时间戳，不能仅依赖一次性事件队列。
+- 本地勾选、撤销即时更新进度；Bangumi 的“在看”条目也拉取进度，尚未推送的本地操作不被旧拉取覆盖。
+- 2026-09-13 的维护者验收通过只代表已反馈场景，不代表覆盖所有 Android 厂商的省电策略。
 
 ## 5. WebDAV 同步
 
@@ -84,6 +97,11 @@ WebDAV 使用用户自己的账户，远端文件固定为 `AniLog/anilog-sync.j
 - WebDAV 地址、用户名、密码和其他凭据
 
 合并时使用 `syncUpdatedAt` 或记录更新时间选择较新版本。删除墓碑用于防止另一设备把已取消的追番重新带回。新增、删除、完成任务和追番变化都必须更新同步时间。
+
+`v0.7.4` 新生成任务标记 `statusSource=airing`，不能以较新的生成时间覆盖已完成记录；
+手动完成/撤销标记 `statusSource=local`，继续按时间戳合并。Windows 与 Android 都应升级。
+两端上传前均剥离 `nextAiringEpisode`、`nextEpisode`、`nextAiringAt`、`nextEpisodeId`、
+`nextAiringPrecision`、`scheduleUpdatedAt`、`episodeSchedule` 等本机派生日程字段。
 
 Windows 启动后进行一次同步，本地变化会延迟合并，空闲时最多约 15 分钟检查一次。Windows 非密码配置存于 `webdav-tauri.json`，密码进入 Credential Manager。Android 密码进入 Android Keystore，原生层负责传输。不要在日志中打印 Authorization、完整响应文档或密码。
 
@@ -127,7 +145,7 @@ Windows 会尝试迁移旧 Electron 状态和 WebDAV 非密码配置。Android �
 - Node.js 22
 - Rust 1.85+
 - Windows 10/11
-- Android 使用 JDK 17 或 21，不支持 JDK 25
+- Android 正式构建使用 JBR/JDK 21；本机 JDK 17 与 JDK 25 均不适用于当前正式构建链
 - Android SDK 36
 - Android NDK `27.2.12479018`
 
@@ -181,7 +199,7 @@ npm run tauri:android:build:original
 
 两条正式构建命令都固定使用 `--target aarch64`；发布 APK 必须只包含 `arm64-v8a`。
 
-### 9.1 v0.7.3 实际构建顺序
+### 9.1 正式构建顺序
 
 Windows Standard 与 Original 共用 bundle 输出目录，Android 两个 edition 也共用 APK 输出路径，因此必须串行构建并在每一步结束后立即复制改名：
 
@@ -195,6 +213,9 @@ Windows Standard 与 Original 共用 bundle 输出目录，Android 两个 editio
 8. 对两个 APK 分别执行 `zipalign -P 16`，再用同一正式密钥执行 `apksigner sign`。
 9. 使用 `apksigner verify --verbose --print-certs`、`aapt dump badging`、`zipalign -c -P 16 -v 4` 和 ZIP 文件清单验证签名、包名、版本、对齐和 ABI。
 10. 计算四件套 SHA-256，写入 `release-notes/vX.Y.Z.md`，再提交、打标签和创建正式 Release。
+
+当前正式包存放在本机 `release/tauri-v0.7.4/`；旧 `release/tauri-v0.7.4-rc.1/` 保留为验收备份，
+不会上传为正式附件。安装包、签名中间产物和本地交接文件不进入 Git。
 
 虽然 Tauri 产物路径中写着 `universal`，只要构建命令带 `--target aarch64`，最终包可以且应该只有 `lib/arm64-v8a/libanilog_lib.so`；是否为单 ABI 必须看 APK 内容，不能根据目录名判断。
 
@@ -228,10 +249,16 @@ Windows Standard 与 Original 共用 bundle 输出目录，Android 两个 editio
 - Electron/Capacitor Web 回退构建
 - Tauri 标准版和 Original Web 构建
 - 两套 Cargo feature 测试
-- edition、状态刷新、任务保留、窗口生命周期、WebDAV、缓存、季度缓存、数据迁移和 Bangumi 回归测试
+- edition、状态刷新、任务保留、每日提醒、窗口生命周期、WebDAV、缓存、季度缓存、星期分组与日期精度、数据迁移和 Bangumi 回归测试
 - production dependency audit
 
 CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支上的普通 push 不一定有 CI 结果，发布前不能据此假定已验证。
+
+Android 原生构建和 JVM 测试仍需本地运行。JBR 21 下串行设置
+`ANILOG_ANDROID_EDITION=standard` / `original`，分别在 `src-tauri/gen/android/` 运行
+`.\gradlew.bat :app:testUniversalDebugUnitTest --console=plain`。不能只用 Node 回退实现测试
+代替 Rust/Java 测试。`v0.7.4` 验收基线为 Rust Standard 171 项、Original 30 项，
+Android 每个 edition 31 项、12 个 Node 脚本，以及 320/390/768/1280 宽度的布局检查。
 
 ## 11. 发布约束
 
@@ -248,6 +275,7 @@ CI 目前只对 `main` 的 push 和目标为 `main` 的 PR 触发。迁移分支
 ## 12. 已知风险与后续事项
 
 - Tauri 已成为正式架构，仍需继续收集 Windows/Android 反馈。
+- CSP 仍关闭，需另行安排双端安全加固；详见 [`REVIEW_FOLLOWUPS.md`](REVIEW_FOLLOWUPS.md)，不把历史已修复项继续当作当前故障。
 - AniList 是分钟级播出时间的唯一可靠来源；`bangumi-data` 记录的是首播/流媒体锚点，不足以推断临时改档、停播或后续每集的分钟。AniList 返回 403/429/5xx 时只能保留最近一次可信时间或退回日期级信息，禁止按周播锚点“补推”下一集。
 - 现有状态文件可能来自 v0.7.0 以前的旧键、WebDAV 删除墓碑或旧版错误任务。排障时先备份 `<安装目录>\data`，再记录 `anilog-state.json`、`season-cache` 和同步文件的时间戳；不要直接删除坚果云远端文件来“解决”本地显示问题。
 - 追番列表的 `nextAiringEpisode` 是派生缓存，不属于 WebDAV 同步字段。若出现“加入后短暂有时间、随后消失”，优先检查权威刷新失败、旧删除墓碑合并和本地/远端 `subjectId` 是否重复，而不是把缓存字段重新写入同步文档。
