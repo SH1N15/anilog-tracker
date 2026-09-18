@@ -68,7 +68,10 @@ pub(super) fn merge_snapshot(state: &mut Value, status: &Value, now: i64) -> any
                 {
                     let incoming = entry.as_object().cloned().unwrap_or_default();
                     *entry = local.clone();
-                    entry.as_object_mut().unwrap().extend(incoming);
+                    // rc.4 问题 1 加固：损坏状态记录不得 panic 整个启动桥接。
+                    if let Some(object) = entry.as_object_mut() {
+                        object.extend(incoming);
+                    }
                 }
             }
         }
@@ -117,7 +120,8 @@ pub(super) fn merge_snapshot(state: &mut Value, status: &Value, now: i64) -> any
         // Only an explicit per-episode future fact may retract a pending task.
         // A stale `next` or a date with no time is not evidence that it is unaired.
         if let Some(schedule) = native["episodeSchedule"].as_array() {
-            state["tasks"].as_array_mut().unwrap().retain_mut(|task| {
+            let Some(tasks) = state["tasks"].as_array_mut() else { continue };
+            tasks.retain_mut(|task| {
                 if value_i64(task.get("subjectId")) != id
                     && value_i64(task.get("animeId")) != id
                 {

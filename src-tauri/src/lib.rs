@@ -3021,15 +3021,41 @@ fn map_subjects_to_anime(
 async fn get_state(_app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
     #[cfg(target_os = "android")]
     {
-        let context = context.inner().clone();
-        return tauri::async_runtime::spawn_blocking(move || {
-            if mobile::consume_events(&_app, &context).is_err() {
+        // rc.4 问题 3：冷启动不再把整轮 JNI 桥接（consume_events：全量快照
+        // 往返 + 合并 + 落盘）作为进入界面的门槛——低端机/存储繁忙时该链路
+        // 可卡数分钟（"正在读取本地数据"）。setup() 已把持久原生快照合并进
+        // 内存状态，这里立即返回快照；原生事件队列在后台消费，完成后经
+        // state-changed 广播刷新界面（与"先显示可信快照再后台刷新"契约一致）。
+        let app = _app.clone();
+        let context_state = context.inner().clone();
+        let app_for_bridge = app.clone();
+        let context_for_bridge = context_state.clone();
+        tauri::async_runtime::spawn(async move {
+            let started = std::time::Instant::now();
+            let app_for_foreground = app_for_bridge.clone();
+            let context_for_foreground = context_for_bridge.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                mobile::consume_events(&app_for_bridge, &context_for_bridge)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            let failure = match &result {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(error.clone()),
+                Err(_) => Some("bridge task panicked".to_string()),
+            };
+            info!(
+                "android native consume_events finished in {:?}: {}",
+                started.elapsed(),
+                failure.as_deref().unwrap_or("ok")
+            );
+            if failure.is_some() {
                 warn!("native state refresh unavailable; retaining the loaded local snapshot");
             }
             #[cfg(feature = "standard")]
-            maybe_spawn_foreground_sync(&_app, &context);
-            context.public_state()
-        }).await.map_err(|_| "无法读取本地状态".to_string());
+            maybe_spawn_foreground_sync(&app_for_foreground, &context_for_foreground);
+        });
+        Ok(context_state.public_state())
     }
     #[cfg(not(target_os = "android"))]
     Ok(context.public_state())
@@ -3041,6 +3067,17 @@ fn refresh_mobile_configuration(app: &AppHandle, context: &AppContext) -> Result
     #[cfg(not(target_os = "android"))]
     let _ = (app, context);
     Ok(())
+}
+
+/// rc.4 问题 1（B）：安卓侧用户动作（任务勾选/追番变更/核对撤销）后，除
+/// 唤醒进程内 WebDAV 循环外，再排一个 WorkManager 立即任务（见
+/// [`mobile::enqueue_immediate_sync`]）。仅安卓编译；各调用点在
+/// refresh_mobile_configuration 之后触发。
+#[cfg(target_os = "android")]
+fn enqueue_native_sync(app: &AppHandle) {
+    if let Err(error) = mobile::enqueue_immediate_sync(app) {
+        warn!("failed to enqueue native immediate sync: {error}");
+    }
 }
 
 /// standard 版 Bangumi 来源追番条目形状（Phase 2 主键迁移）：id=subjectId、
@@ -3456,6 +3493,8 @@ fn toggle_follow(
     // type=5）。函数内部按编译目标判空。
     notify_bangumi_sync_wakeup(true);
     refresh_mobile_configuration(&app, &context)?;
+    #[cfg(target_os = "android")]
+    enqueue_native_sync(&app);
     emit_state(&app, &context);
     refresh_new_follow_schedules(&app, &context, added);
     Ok(context.public_state())
@@ -3478,6 +3517,8 @@ fn unfollow(
     context.webdav_wakeup.notify_one();
     notify_bangumi_sync_wakeup(true);
     refresh_mobile_configuration(&app, &context)?;
+    #[cfg(target_os = "android")]
+    enqueue_native_sync(&app);
     emit_state(&app, &context);
     Ok(context.public_state())
 }
@@ -3557,6 +3598,8 @@ fn update_follow_title(
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
     refresh_mobile_configuration(&app, &context)?;
+    #[cfg(target_os = "android")]
+    enqueue_native_sync(&app);
     emit_state(&app, &context);
     Ok(context.public_state())
 }
@@ -3746,6 +3789,8 @@ fn toggle_task(
     // 问题 2b：bangumi 任务完成 → 动作唤醒桌面自动同步（写回单集进度）。
     notify_bangumi_sync_wakeup(bangumi_task_changed);
     refresh_mobile_configuration(&app, &context)?;
+    #[cfg(target_os = "android")]
+    enqueue_native_sync(&app);
     emit_state(&app, &context);
     Ok(context.public_state())
 }
@@ -3768,6 +3813,8 @@ fn resolve_task_review(
     refresh_mobile_configuration(&app, &context)?;
     context.webdav_wakeup.notify_one();
     notify_bangumi_sync_wakeup(true);
+    #[cfg(target_os = "android")]
+    enqueue_native_sync(&app);
     emit_state(&app, &context);
     Ok(context.public_state())
 }
@@ -4116,10 +4163,9 @@ fn apply_airing_schedules_inner(
         };
         let id = format!("{task_anime_id}-{episode}");
         if seen.insert(id.clone()) {
-            state["seenAiringEvents"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(id));
+            if let Some(events) = state["seenAiringEvents"].as_array_mut() {
+                events.push(json!(id));
+            }
             outcome.aired += 1;
         }
         if !create_tasks {
@@ -4176,7 +4222,9 @@ fn apply_airing_schedules_inner(
             new_task["episodeSortKey"] = json!(episode.to_string());
             new_task["episodeType"] = json!("regular");
         }
-        state["tasks"].as_array_mut().unwrap().push(new_task);
+        if let Some(tasks) = state["tasks"].as_array_mut() {
+            tasks.push(new_task);
+        }
         known.insert(id);
         outcome.created += 1;
     }
@@ -5585,12 +5633,14 @@ async fn sync_schedules(
     outcome.created = state["tasks"].as_array().into_iter().flatten()
         .filter(|task| watch_history::is_pending(task, now) && !known.contains(&value_string(task.get("id")))).count();
     state["lastSyncAt"] = json!(now);
-    state["tasks"]
-        .as_array_mut()
-        .unwrap()
-        .sort_by(|left, right| {
+    // rc.4 问题 1 加固：状态文件被旧版本或异常中断写坏成非数组时，
+    // unwrap 会 panic 并静默杀死整个后台同步循环（rc.3 停摆事故的
+    // 候选根因之一）。这里起改为跳过排序，不中断本轮同步。
+    if let Some(tasks) = state["tasks"].as_array_mut() {
+        tasks.sort_by(|left, right| {
             value_i64(right.get("airingAt")).cmp(&value_i64(left.get("airingAt")))
         });
+    }
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
     emit_state(app, context);
@@ -5599,27 +5649,7 @@ async fn sync_schedules(
     }
     #[cfg(desktop)]
     if outcome.aired > 0 {
-        let (language, notifications_enabled) = {
-            let state = context.state.lock().map_err(|_| "状态锁不可用")?;
-            (
-                value_string(state["settings"].get("uiLanguage")),
-                value_bool(state["settings"].get("notifyWhenAired")),
-            )
-        };
-        if notifications_enabled {
-            let (title, body) = if language == "en-US" {
-                (
-                    "Anime updates are available".to_string(),
-                    format!("{} followed episode(s) have aired.", outcome.aired),
-                )
-            } else {
-                (
-                    "追番已更新".to_string(),
-                    format!("你追的番剧有 {} 集新内容已播出。", outcome.aired),
-                )
-            };
-            show_desktop_notification(app, title, body);
-        }
+        show_aired_update_notification(app, context, outcome.aired);
     }
     let mut result = json!({"created": outcome.created, "syncedAt": now});
     if !batch.warnings.is_empty() {
@@ -5688,8 +5718,10 @@ fn claim_bangumi_cached_notifications(state: &mut Value, directory: &Path, now: 
     let mut count = 0;
     for event in events {
         if seen.insert(event.clone()) {
-            state["seenAiringEvents"].as_array_mut().unwrap().push(json!(event));
-            count += 1;
+            if let Some(events) = state["seenAiringEvents"].as_array_mut() {
+                events.push(json!(event));
+                count += 1;
+            }
         }
     }
     count
@@ -9186,9 +9218,94 @@ async fn perform_webdav_sync(app: &AppHandle, context: &AppContext) -> anyhow::R
     config["lastSyncAt"] = json!(now_seconds());
     config["lastError"] = json!("");
     persist_webdav_config(context, &config)?;
+    // rc.4 问题 2：合并进来的新播出任务也触发"追番已更新"通知（见
+    // claim_merged_airing_notifications）。claim 后必须落盘，否则下一轮
+    // 合并会重复计数、反复弹通知。
+    #[cfg(desktop)]
+    let merged_aired = {
+        let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
+        let aired = claim_merged_airing_notifications(&mut state, now_seconds());
+        if aired > 0 {
+            context.save_state()?;
+            emit_state(app, context);
+        }
+        aired
+    };
+    #[cfg(desktop)]
+    if merged_aired > 0 {
+        show_aired_update_notification(app, context, merged_aired);
+    }
+    #[cfg(not(desktop))]
+    let _ = app;
     Ok(
         json!({"ok": true, "changed": local_changed, "syncedAt": config["lastSyncAt"], "message": if local_changed { "已合并另一台设备的更新" } else { "两端数据已同步" }}),
     )
+}
+
+#[cfg(desktop)]
+fn show_aired_update_notification(app: &AppHandle, context: &AppContext, aired: usize) {
+    let (language, notifications_enabled) = {
+        let Ok(state) = context.state.lock() else { return };
+        (
+            value_string(state["settings"].get("uiLanguage")),
+            value_bool(state["settings"].get("notifyWhenAired")),
+        )
+    };
+    if !notifications_enabled {
+        return;
+    }
+    let (title, body) = if language == "en-US" {
+        (
+            "Anime updates are available".to_string(),
+            format!("{aired} followed episode(s) have aired."),
+        )
+    } else {
+        (
+            "追番已更新".to_string(),
+            format!("你追的番剧有 {aired} 集新内容已播出。"),
+        )
+    };
+    show_desktop_notification(app, title, body);
+}
+
+/// rc.4 问题 2：WebDAV 合并进来的新播出任务同样计入更新通知。rc.3 事故
+/// 中 Windows 轮询循环停摆，播出信息只能经安卓端同步进来，而合并路径
+/// 设计上不发通知 → PC 端对已播出内容完全无感。现在合并后扫描最近 24 小时
+/// 内播出、`statusSource=airing` 的 pending 任务（与 Android catchUp 窗口
+/// 一致），未见过者入 seenAiringEvents 并触发一条汇总通知。手动完成的
+/// 任务（statusSource=local）与旧历史不会命中。
+#[cfg(desktop)]
+fn claim_merged_airing_notifications(state: &mut Value, now: i64) -> usize {
+    let mut seen: HashSet<String> = state["seenAiringEvents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let mut fresh_ids = Vec::new();
+    let Some(tasks) = state["tasks"].as_array() else { return 0 };
+    for task in tasks {
+        if value_string(task.get("status")) != "pending"
+            || value_string(task.get("statusSource")) != "airing"
+        {
+            continue;
+        }
+        let airing_at = value_i64(task.get("airingAt"));
+        if airing_at <= 0 || airing_at < now - 86_400 {
+            continue;
+        }
+        let id = value_string(task.get("id"));
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        fresh_ids.push(id);
+    }
+    let Some(events) = state["seenAiringEvents"].as_array_mut() else { return 0 };
+    for id in &fresh_ids {
+        events.push(json!(id));
+    }
+    fresh_ids.len()
 }
 
 #[tauri::command]
@@ -9374,37 +9491,50 @@ fn webdav_is_enabled(app: &AppHandle, context: &AppContext) -> bool {
 }
 
 fn start_webdav_background(app: AppHandle, context: AppContext) {
+    // rc.4 问题 1：与桌面 AniList 循环同样的监督——WebDAV 拉取循环是
+    // 跨设备同步的真正执行者，panic 后必须留下日志并自动重建。
     tauri::async_runtime::spawn(async move {
-        let mut startup = true;
         loop {
-            let delay = if startup {
-                std::time::Duration::from_secs(8)
-            } else {
-                std::time::Duration::from_secs(15 * 60)
-            };
-            let changed = tokio::time::timeout(delay, context.webdav_wakeup.notified())
-                .await
-                .is_ok();
-            if changed {
-                while tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    context.webdav_wakeup.notified(),
-                )
-                .await
-                .is_ok()
-                {}
+            let worker = tauri::async_runtime::spawn(webdav_sync_worker(app.clone(), context.clone()));
+            match worker.await {
+                Ok(()) => warn!("WebDAV background sync loop exited normally; restarting"),
+                Err(error) => warn!("WebDAV background sync loop crashed; restarting: {error}"),
             }
-            if webdav_is_enabled(&app, &context) {
-                // 问题 3：空闲 tick 与唤醒 tick 一律走完整同步循环（下载→
-                // merge→reconcile→上传；无变化时上传自动跳过），成功后记账
-                // lastWebDavSyncAt 真实前进；不与手动同步并发的锁语义不变。
-                if let Err(error) = perform_webdav_sync_tracked(&app, &context).await {
-                    warn!("background WebDAV sync failed: {error}");
-                }
-            }
-            startup = false;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
+}
+
+async fn webdav_sync_worker(app: AppHandle, context: AppContext) {
+    let mut startup = true;
+    loop {
+        let delay = if startup {
+            std::time::Duration::from_secs(8)
+        } else {
+            std::time::Duration::from_secs(15 * 60)
+        };
+        let changed = tokio::time::timeout(delay, context.webdav_wakeup.notified())
+            .await
+            .is_ok();
+        if changed {
+            while tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                context.webdav_wakeup.notified(),
+            )
+            .await
+            .is_ok()
+            {}
+        }
+        if webdav_is_enabled(&app, &context) {
+            // 问题 3：空闲 tick 与唤醒 tick 一律走完整同步循环（下载→
+            // merge→reconcile→上传；无变化时上传自动跳过），成功后记账
+            // lastWebDavSyncAt 真实前进；不与手动同步并发的锁语义不变。
+            if let Err(error) = perform_webdav_sync_tracked(&app, &context).await {
+                warn!("background WebDAV sync failed: {error}");
+            }
+        }
+        startup = false;
+    }
 }
 
 #[tauri::command]
@@ -9630,33 +9760,60 @@ fn reconcile_autostart(app: &AppHandle, enabled: bool) -> anyhow::Result<()> {
 
 #[cfg(desktop)]
 fn start_desktop_background(app: AppHandle, context: AppContext) {
+    // rc.4 问题 1：同步循环曾因单轮 panic 被 tokio 静默吞掉——任务死亡后
+    // 没有任何日志、UI 与重启，桌面端最长 8 小时不再拉取 WebDAV/AniList
+    // （"假同步"与"PC 收不到更新通知"的共同根因）。现在外层监督：worker
+    // panic 或异常退出即记 WARN 并 10 秒后重建循环；正常永不退出。
     tauri::async_runtime::spawn(async move {
         loop {
-            if let Err(error) = sync_now_inner(&app, &context).await {
-                warn!("background AniList sync failed: {error}");
+            let worker = tauri::async_runtime::spawn(desktop_sync_worker(app.clone(), context.clone()));
+            match worker.await {
+                Ok(()) => warn!("desktop background sync loop exited normally; restarting"),
+                Err(error) => warn!("desktop background sync loop crashed; restarting: {error}"),
             }
-            loop {
-                let minutes = {
-                    let state = context.state.lock().ok();
-                    state
-                        .as_ref()
-                        .map(|state| {
-                            value_i64(state["settings"].get("pollIntervalMinutes")).clamp(1, 1440)
-                        })
-                        .unwrap_or(5)
-                };
-                if tokio::time::timeout(
-                    std::time::Duration::from_secs((minutes * 60) as u64),
-                    context.sync_wakeup.notified(),
-                )
-                .await
-                .is_err()
-                {
-                    break;
-                }
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
+}
+
+#[cfg(desktop)]
+async fn desktop_sync_worker(app: AppHandle, context: AppContext) {
+    loop {
+        if let Err(error) = sync_now_inner(&app, &context).await {
+            warn!("background AniList sync failed: {error}");
+        }
+        // rc.4 问题 1：每轮心跳（INFO）。日志里心跳中断即同步循环停摆的
+        // 直接证据，不再需要靠"有没有网络请求"事后推断。
+        info!("desktop AniList sync heartbeat: {}", now_seconds());
+        loop {
+            let minutes = {
+                let state = context.state.lock().ok();
+                state
+                    .as_ref()
+                    .map(|state| {
+                        value_i64(state["settings"].get("pollIntervalMinutes")).clamp(1, 1440)
+                    })
+                    .unwrap_or(5)
+            };
+            if tokio::time::timeout(
+                std::time::Duration::from_secs((minutes * 60) as u64),
+                context.sync_wakeup.notified(),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(desktop)]
+fn daily_task_reminder_due(state: &Value, today: &str, current_time: &str) -> bool {
+    let reminder_time = value_string(state["settings"].get("dailyTaskReminderTime"));
+    value_bool(state["settings"].get("dailyTaskReminderEnabled"))
+        && value_string(state.get("lastTaskReminderDate")) != today
+        && current_time >= reminder_time.as_str()
 }
 
 #[cfg(desktop)]
@@ -9665,11 +9822,7 @@ fn claim_daily_task_reminder(
     today: &str,
     current_time: &str,
 ) -> Option<(usize, String)> {
-    let reminder_time = value_string(state["settings"].get("dailyTaskReminderTime"));
-    if !value_bool(state["settings"].get("dailyTaskReminderEnabled"))
-        || value_string(state.get("lastTaskReminderDate")) == today
-        || current_time < reminder_time.as_str()
-    {
+    if !daily_task_reminder_due(state, today, current_time) {
         return None;
     }
     let pending = state["tasks"]
@@ -9685,11 +9838,39 @@ fn claim_daily_task_reminder(
     Some((pending, value_string(state["settings"].get("uiLanguage"))))
 }
 
+/// rc.4 问题 1：待看提醒发送前若坚果云数据已超过 30 分钟未同步，先拉取合并
+/// 一次再计数。rc.3 事故里安卓端早已完成的集，PC 端因后台停摆仍计为待看，
+/// 20:00 准点提醒对着已完成任务误报。拉取失败只记日志、不阻塞提醒（宁可
+/// 提醒旧数据，也不能让提醒依赖网络）。pending==0 时不 claim，下一分钟靠
+/// 30 分钟新鲜度门避免重复触网。
 #[cfg(desktop)]
-fn send_daily_task_reminder_if_due(app: &AppHandle, context: &AppContext) -> anyhow::Result<bool> {
+async fn refresh_webdav_before_reminder(app: &AppHandle, context: &AppContext) {
+    if !webdav_is_enabled(app, context) {
+        return;
+    }
+    // perform_webdav_sync 成功后写配置文件的 lastSyncAt（两 edition 通用）。
+    let last_sync = value_i64(webdav_config(context).get("lastSyncAt"));
+    if last_sync > 0 && now_seconds() - last_sync < 30 * 60 {
+        return; // 数据仍新鲜，无需为提醒额外触网
+    }
+    if let Err(error) = perform_webdav_sync_tracked(app, context).await {
+        warn!("daily reminder pre-sync failed; sending with last known local state: {error}");
+    }
+}
+
+#[cfg(desktop)]
+async fn send_daily_task_reminder_if_due(app: &AppHandle, context: &AppContext) -> anyhow::Result<bool> {
     let now = Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let current_time = now.format("%H:%M").to_string();
+    // 先判断是否到点（不 claim），到点才做新鲜度拉取，拉取后再 claim 计数。
+    if !{
+        let Ok(state) = context.state.lock() else { return Ok(false) };
+        daily_task_reminder_due(&state, &today, &current_time)
+    } {
+        return Ok(false);
+    }
+    refresh_webdav_before_reminder(app, context).await;
     let Some((pending, language)) = ({
         let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
         claim_daily_task_reminder(&mut state, &today, &current_time)
@@ -9717,7 +9898,7 @@ fn send_daily_task_reminder_if_due(app: &AppHandle, context: &AppContext) -> any
 fn start_desktop_task_reminders(app: AppHandle, context: AppContext) {
     tauri::async_runtime::spawn(async move {
         loop {
-            if let Err(error) = send_daily_task_reminder_if_due(&app, &context) {
+            if let Err(error) = send_daily_task_reminder_if_due(&app, &context).await {
                 warn!("daily task reminder failed: {error}");
             }
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -9752,9 +9933,17 @@ pub fn run() {
             let context = load_context(app.handle(), original)?;
             #[cfg(target_os = "android")]
             {
+                // rc.4 问题 3：setup 阶段三段桥接各记耗时，真机日志用于
+                // 定位冷启动"正在读取本地数据"卡在哪一环。
+                let setup_started = std::time::Instant::now();
                 mobile::import_legacy_state(app.handle(), &context)?;
+                info!("android setup import_legacy_state: {:?}", setup_started.elapsed());
+                let step_started = std::time::Instant::now();
                 mobile::consume_events(app.handle(), &context)?;
+                info!("android setup consume_events: {:?}", step_started.elapsed());
+                let step_started = std::time::Instant::now();
                 mobile::configure(app.handle(), &context)?;
+                info!("android setup configure: {:?}", step_started.elapsed());
             }
             app.manage(context.clone());
             // Phase 4 任务 1：Android 前台过期同步补偿（setup 完成后异步执行，
@@ -10497,6 +10686,59 @@ mod tests {
             claim_daily_task_reminder(&mut state, "2026-07-29", "21:00"),
             None
         );
+    }
+
+    #[cfg(desktop)]
+    fn airing_task_fixture(id: &str, status: &str, source: &str, airing_at: i64) -> Value {
+        json!({
+            "id": id, "animeId": id.split('-').next().and_then(|part| part.parse::<i64>().ok()).unwrap_or(0),
+            "animeTitle": "Test", "episode": 1, "status": status,
+            "statusSource": source, "airingAt": airing_at,
+            "createdAt": airing_at, "completedAt": Value::Null,
+            "syncUpdatedAt": airing_at * 1000
+        })
+    }
+
+    /// rc.4 问题 2：WebDAV 合并进来的新播出任务（statusSource=airing 且
+    /// 播出时间在 24 小时内）计入通知且只计一次；已完成/本地动作/旧历史
+    /// 不计。
+    #[cfg(desktop)]
+    #[test]
+    fn merged_airing_notifications_are_claimed_once() {
+        let now = 1_800_000_000_i64;
+        let mut state = default_state(false);
+        state["tasks"] = json!([
+            airing_task_fixture("633836-6", "pending", "airing", now - 3_600),
+            airing_task_fixture("633836-5", "completed", "airing", now - 7_200),
+            airing_task_fixture("571784-11", "pending", "local", now - 3_600),
+            airing_task_fixture("100-1", "pending", "airing", now - 90_000),
+        ]);
+
+        assert_eq!(claim_merged_airing_notifications(&mut state, now), 1);
+        assert_eq!(
+            state["seenAiringEvents"],
+            json!(["633836-6"]),
+            "仅新播出任务入 seen；本地动作/已完成/超窗任务不入"
+        );
+        // 幂等：再次合并扫描不得重复计数（防每轮 WebDAV tick 反复弹通知）。
+        assert_eq!(claim_merged_airing_notifications(&mut state, now), 0);
+    }
+
+    /// rc.4 问题 1：待看到点判定拆分（不计数、不落 lastTaskReminderDate），
+    /// 供发送前的新鲜度 WebDAV 拉取前置使用。
+    #[cfg(desktop)]
+    #[test]
+    fn daily_reminder_due_matches_claim_gate() {
+        let mut state = default_state(false);
+        state["settings"]["dailyTaskReminderEnabled"] = json!(true);
+        state["settings"]["dailyTaskReminderTime"] = json!("20:00");
+        state["tasks"] = json!([task("1-1", 1, "pending", 1_000)]);
+
+        assert!(!daily_task_reminder_due(&state, "2026-07-29", "19:59"));
+        assert!(daily_task_reminder_due(&state, "2026-07-29", "20:00"));
+        // 已发送当日不再视为到点（claim 写 lastTaskReminderDate 后由 due 拦截）。
+        state["lastTaskReminderDate"] = json!("2026-07-29");
+        assert!(!daily_task_reminder_due(&state, "2026-07-29", "21:00"));
     }
 
     // -- Phase 2：STATE_VERSION 3 迁移 + 映射引擎 ----------------------------

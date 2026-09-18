@@ -29,6 +29,9 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun configure(invoke: Invoke) {
+    // rc.4 问题 3：配置桥接是冷启动最重的 JNI 往返（快照写入 + 逐番重排
+    // 闹钟 + 缓存投影），耗时写进 logcat 供真机定位"正在读取本地数据"卡顿。
+    val startedAt = android.os.SystemClock.elapsedRealtime()
     try {
       val args = invoke.getArgs()
       val before = MobileStore.following(activity.applicationContext)
@@ -67,12 +70,21 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
       if (args.optBoolean("notificationsEnabled", true) && Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
         ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 41001)
       }
+      android.util.Log.i("AniLog", "configure bridge finished in " + (android.os.SystemClock.elapsedRealtime() - startedAt) + "ms")
       invoke.resolve(status(JSONArray(), false))
     } catch (error: Exception) { invoke.reject(error.message, error) }
   }
 
   @Command
   fun consumeEvents(invoke: Invoke) { invoke.resolve(status(MobileStore.consumeEvents(activity.applicationContext), true)) }
+
+  /** rc.4 问题 1（B）：Rust 用户动作（任务勾选/追番变更）后调用，排一个
+   *  WorkManager 一次性同步，进程被厂商省电杀掉后仍能完成上传合并。 */
+  @Command
+  fun enqueueImmediateSync(invoke: Invoke) {
+    BackgroundSync.enqueueImmediate(activity.applicationContext)
+    invoke.resolve()
+  }
 
   @Command
   fun getLegacyState(invoke: Invoke) {

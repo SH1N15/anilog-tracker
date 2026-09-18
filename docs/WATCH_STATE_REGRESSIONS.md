@@ -6,6 +6,43 @@ The maintainer confirmed acceptance of v0.7.4-rc.1 on 2026-09-13 and authorized
 the v0.7.4 stable release. Stable packages use Android versionCode 13 rather
 than the candidate's 12.
 
+## Background Sync Liveness And Notifications (v0.7.5-rc.4)
+
+The 2026-09-17 field incident: the desktop AniList poll and WebDAV background
+loops went silent for ~8 hours while the daily-reminder loop kept running.
+A single panicked or wedged iteration killed the loop task with no log, no
+restart, and no UI signal; the remote completion sat unpulled while the
+settings page still showed a recent sync timestamp. Contracts added for rc.4:
+
+- A panic or abnormal exit in the desktop AniList sync loop or the WebDAV
+  background loop must be logged (WARN) and the loop rebuilt automatically;
+  silent task death is unacceptable. Each loop also logs an INFO heartbeat
+  every iteration so a stall is visible in the log as a missing heartbeat.
+- State files with corrupted array fields must not panic the sync path:
+  task sorting and `seenAiringEvents` insertion skip gracefully, and the
+  Android native snapshot merge guards its object/array access.
+- The desktop daily reminder must attempt a WebDAV pull-merge before counting
+  pending tasks when the last successful sync is older than 30 minutes. A
+  failed pull must not block the reminder (stale reminder beats no reminder).
+- Episodes discovered through WebDAV merge (created by another device's
+  airing pipeline within the last 24 hours) must trigger the same "追番已更新"
+  desktop notification as the polling path, exactly once per task id
+  (`claim_merged_airing_notifications`); completed, locally toggled, and
+  older-than-24h tasks must not re-notify.
+- Android user actions (task toggle, review resolution, follow changes) must
+  enqueue a WorkManager immediate sync in addition to the in-process wakeup:
+  the vendor may kill the foreground process within seconds, and the
+  one-time worker survives process death (KEEP policy, idempotent).
+- Android cold start must not gate the UI on the full JNI snapshot round
+  trip: `get_state` returns the in-memory snapshot immediately and the
+  native event consumption runs in the background, refreshing the UI via
+  the state-changed event ("trusted snapshot first, refresh afterwards").
+  Setup-stage and bridge timings are logged for field diagnosis.
+- Opening the Android app must never re-fire the 20:00 daily summary
+  (`checkMissed=false` in MainActivity): the user is already looking at the
+  task list, and a late catch-up reads as a duplicate. BootReceiver keeps
+  its catch-up for the missed-after-reboot scenario.
+
 ## Episode Identity And Time
 
 - A Bangumi subject owns its local `ep` and `episodeId`. Two subjects sharing

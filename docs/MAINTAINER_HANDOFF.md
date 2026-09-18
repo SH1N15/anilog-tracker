@@ -11,8 +11,8 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
 - 正式版：`v0.7.4`，GitHub Latest
-- 当前开发基线：从 `v0.7.4`（`090593d`）修复，当前本地候选版 `v0.7.5-rc.3`。
-- 当前维护安排（2026-09-14）：rc.2 已修正 AniList 查询契约、本季集号匹配和状态初始化；维护者继续反馈未播出集的旧完成记录影响已看计数。rc.3 保留异常记录供核对、隔离计数与自动上传，Android 使用 `versionCode=17`，高于 rc.2 的 code 16；公开正式版、GitHub Latest、既有标签和附件保持不变。本轮不自动提交、推送或发布。
+- 当前开发基线：从 `v0.7.4`（`090593d`）修复，当前本地候选版 `v0.7.5-rc.4`。
+- 当前维护安排（2026-09-18）：rc.3 真机反馈四项问题——后台同步循环停摆（AniList 轮询与 WebDAV 循环静默死亡约 8 小时，无日志无重启）、PC 端对 WebDAV 合并进来的播出不发通知、安卓冷启动卡"正在读取本地数据"、安卓开 app 补发 20:00 每日汇总。rc.4 加监督重启/心跳/unwrap 加固、合并播出计入通知、get_state 先返回快照、开屏不再补发；Android 使用 `versionCode=18`，高于 rc.3 的 code 17；公开正式版、GitHub Latest、既有标签和附件保持不变。本轮不自动提交、推送或发布。
 - Android `versionCode`：`13`（上一正式版 `v0.7.3` 为 `11`，本地验收版 `v0.7.4-rc.1` 为 `12`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 

@@ -110,6 +110,17 @@ pub fn consume_events(app: &AppHandle, context: &AppContext) -> anyhow::Result<V
     Ok(status)
 }
 
+/// rc.4 问题 1（B）：安卓侧用户动作（任务勾选/追番变更）后除唤醒进程内
+/// WebDAV 循环外，再排一个 WorkManager 立即任务。前台进程可能被厂商省电
+/// 策略在几秒内杀掉，进程内唤醒随之丢失；WorkManager 的一次性任务持久化
+/// 于系统，进程死亡后仍会执行完整的下载→合并→上传（BackgroundSyncWorker）。
+/// KEEP 策略幂等：密集动作只产生一次执行。
+pub fn enqueue_immediate_sync(app: &AppHandle) -> anyhow::Result<()> {
+    app.state::<MobileBridge>()
+        .run("enqueueImmediateSync", json!({}))?;
+    Ok(())
+}
+
 pub fn import_legacy_state(app: &AppHandle, context: &AppContext) -> anyhow::Result<bool> {
     let should_import = {
         let state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
