@@ -7,18 +7,17 @@ use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{Datelike, Local};
 use log::{info, warn};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 #[cfg(not(target_os = "android"))]
 use reqwest::header::{ETAG, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(desktop)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(desktop)]
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
@@ -42,6 +41,12 @@ mod mobile;
 mod mobile_state;
 #[cfg(all(test, feature = "standard"))]
 mod watch_progress_tests;
+#[cfg(test)]
+mod sync_intent_tests;
+#[cfg(test)]
+mod startup_schedule_tests;
+mod anilist_cache;
+mod watch_history;
 
 const ANILIST_API: &str = "https://graphql.anilist.co";
 const OFFICIAL_BANGUMI_API: &str = "https://api.bgm.tv/v0";
@@ -51,12 +56,8 @@ const STATE_VERSION: i64 = 3;
 const SYNC_VERSION: i64 = 1;
 const CACHE_VERSION: i64 = 1;
 const BANGUMI_RESOLVER_VERSION: i64 = 5;
-// AniList documents a 90 req/min public limit, but can temporarily tighten
-// the gateway to 30 req/min. Keep the client below the stricter envelope so a
-// burst of season/authority refreshes cannot trigger a rolling 429/403.
-const ANILIST_SAFE_REQUESTS_PER_MINUTE: usize = 30;
-static ANILIST_REQUEST_WINDOW: LazyLock<tokio::sync::Mutex<VecDeque<Instant>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(VecDeque::new()));
+static SEASON_REFRESH_GATE: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 #[cfg(all(feature = "standard", not(target_os = "android")))]
 const BANGUMI_EPISODES_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
 static DAILY_TASK_REMINDER_TIME_RE: LazyLock<regex::Regex> =
@@ -83,6 +84,8 @@ pub struct AppContext {
     sync_wakeup: Arc<tokio::sync::Notify>,
     webdav_wakeup: Arc<tokio::sync::Notify>,
     webdav_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(not(target_os = "android"))]
+    schedule_sync_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(desktop)]
     main_window_opening: Arc<AtomicBool>,
     bangumi_lookup_lock: Arc<tokio::sync::Mutex<()>>,
@@ -97,6 +100,8 @@ pub struct AppContext {
     /// disconnect 时清空）。
     #[cfg(feature = "standard")]
     bangumi_username_cache: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "standard")]
+    bangumi_sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn now_seconds() -> i64 {
@@ -366,10 +371,7 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
             fs::copy(legacy, &state_path).context("migrate existing AniLog state")?;
         }
     }
-    let loaded = fs::read_to_string(&state_path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-        .unwrap_or_else(|| default_state(original));
+    let loaded = read_saved_state(&state_path, original)?;
     let mut state = merge_defaults(loaded, original);
     if let Some(settings) = state.get_mut("settings").and_then(Value::as_object_mut) {
         if original {
@@ -412,6 +414,8 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
         sync_wakeup: Arc::new(tokio::sync::Notify::new()),
         webdav_wakeup: Arc::new(tokio::sync::Notify::new()),
         webdav_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(not(target_os = "android"))]
+        schedule_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(desktop)]
         main_window_opening: Arc::new(AtomicBool::new(false)),
         bangumi_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -421,6 +425,8 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
         bangumi_tokens: bangumi_token_store(app),
         #[cfg(feature = "standard")]
         bangumi_username_cache: Arc::new(Mutex::new(None)),
+        #[cfg(feature = "standard")]
+        bangumi_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     // 覆盖安装后先用本机最近一次成功的 Bangumi 逐集缓存修复旧状态，
     // 再启动窗口与后台同步。这样分季条目的历史 AniList 全局集号/旧日期
@@ -442,6 +448,20 @@ fn load_context(app: &AppHandle, original: bool) -> anyhow::Result<AppContext> {
     }
     context.save_state()?;
     Ok(context)
+}
+
+fn read_saved_state(path: &Path, original: bool) -> anyhow::Result<Value> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(default_state(original)),
+        Err(error) => return Err(error).context("cannot read saved AniLog state; file was not replaced"),
+    };
+    let state: Value = serde_json::from_slice(&bytes)
+        .context("cannot parse saved AniLog state; file was not replaced")?;
+    if !state.is_object() {
+        return Err(anyhow!("invalid saved AniLog state; file was not replaced"));
+    }
+    Ok(state)
 }
 
 /// 按平台选择 Bangumi Token 存储实现（schema §8）：
@@ -510,19 +530,27 @@ impl AppContext {
         self.data_dir.join("anilog-state.json")
     }
     fn save_state(&self) -> anyhow::Result<()> {
-        let mut state = self
+        // Hold the snapshot lock through rename: concurrent writers must not
+        // truncate the same temporary file or persist an older snapshot last.
+        let guard = self
             .state
             .lock()
-            .map_err(|_| anyhow!("state lock poisoned"))?
-            .clone();
+            .map_err(|_| anyhow!("state lock poisoned"))?;
+        let mut state = guard.clone();
         if let Some(object) = state.as_object_mut() {
             object.remove("runtime");
         }
         ensure_sync_metadata(&mut state);
         let target = self.state_path();
         let temporary = target.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&state)?)?;
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&temporary)?;
+            file.write_all(&serde_json::to_vec_pretty(&state)?)?;
+            file.sync_all()?;
+        }
         fs::rename(temporary, target)?;
+        drop(guard);
         Ok(())
     }
     fn public_state(&self) -> Value {
@@ -1354,9 +1382,14 @@ fn authoritative_task(group: &[Value], subject_id: i64, now: i64) -> (Value, boo
         .iter()
         .filter(|task| value_string(task.get("status")) == "completed")
         .collect();
-    let any_completed = !completed.is_empty();
+    let latest = newest_task_of(&group.iter().collect::<Vec<_>>(), "createdAt");
+    let explicit_reset = watch_history::is_reset(latest)
+        && completed.iter().all(|task| record_timestamp(task, "createdAt") < record_timestamp(latest, "createdAt"));
+    let any_completed = !completed.is_empty() && !explicit_reset;
     let references: Vec<&Value> = if any_completed {
         completed
+    } else if explicit_reset {
+        vec![latest]
     } else {
         group.iter().collect()
     };
@@ -1695,7 +1728,8 @@ fn purge_unaired_pending_tasks(state: &mut Value, now: i64) -> bool {
     };
     let before = tasks.len();
     tasks.retain(|task| {
-        !(value_string(task.get("status")) == "pending" && value_i64(task.get("airingAt")) > now)
+        !(value_string(task.get("status")) == "pending"
+            && !watch_history::is_reset(task) && value_i64(task.get("airingAt")) > now)
     });
     before != tasks.len()
 }
@@ -1987,37 +2021,16 @@ fn merge_document_into_state(
         .collect();
     let mut following = Vec::new();
     for id in ids {
-        let local_record = local_following.get(&id);
-        let deleted_at = *deleted.get(&id.to_string()).unwrap_or(&0);
-        let local_is_refollow = local_record.is_some_and(|item| {
-            let intent_at = value_i64(item.get("localFollowIntentAt"));
-            let remote_at = value_i64(item.get("lastPulledFromBangumiAt"));
-            intent_at > 0
-                && (intent_at > deleted_at || remote_at <= 0 || intent_at > remote_at.saturating_mul(1_000))
-        });
-        let winner = if local_is_refollow {
-            local_following.get(&id).cloned()
-        } else {
-            choose_record(
-                local_following.get(&id),
-                remote_following.get(&id),
-                "followedAt",
-            )
-        };
+        let winner = choose_record(
+            local_following.get(&id),
+            remote_following.get(&id),
+            "followedAt",
+        );
         if let Some(winner) = winner {
             let deleted_at = *deleted.get(&id.to_string()).unwrap_or(&0);
-            let local_refollow = {
-                    let intent_at = value_i64(winner.get("localFollowIntentAt"));
-                    let remote_at = value_i64(winner.get("lastPulledFromBangumiAt"));
-                    intent_at > 0
-                        && (intent_at > deleted_at
-                            || remote_at <= 0
-                            || intent_at > remote_at.saturating_mul(1_000))
-                };
-            if local_refollow {
-                // An explicit local re-follow is a new user intent.  A stale
-                // WebDAV tombstone must not erase it; clear the tombstone so
-                // every device converges to the live record.
+            if value_i64(winner.get("localFollowIntentAt")) > deleted_at {
+                // Only a follow intent newer than the deletion can clear it.
+                // Its presence alone must not bypass LWW or a later unfollow.
                 deleted.remove(&id.to_string());
                 following.push(winner);
             } else if record_timestamp(&winner, "followedAt") > deleted_at {
@@ -2095,6 +2108,8 @@ fn merge_document_into_state(
     }
     state["tasks"] = json!(tasks);
     state["syncMetadata"]["followingDeletedAt"] = json!(deleted);
+    #[cfg(feature = "standard")]
+    heal_following_progress(state);
     let merged = document_from_state(state);
     Ok((
         before != comparable_document(&merged)?,
@@ -2110,16 +2125,7 @@ const SEASON_QUERY: &str = r#"query SeasonAnime($season: MediaSeason, $year: Int
       format episodes duration status season seasonYear startDate { year month day } studios(isMain: true) { nodes { name } }
       genres averageScore popularity nextAiringEpisode { episode airingAt timeUntilAiring }
       airingSchedule(notYetAired: true, perPage: 50) { nodes { episode airingAt } } siteUrl
-    }
-  }
-}"#;
-
-#[cfg(not(target_os = "android"))]
-const AIRING_QUERY: &str = r#"query AiredEpisodes($ids: [Int], $from: Int, $to: Int, $page: Int) {
-  Page(page: $page, perPage: 50) { pageInfo { hasNextPage }
-    airingSchedules(mediaId_in: $ids, airingAt_greater: $from, airingAt_lesser: $to, sort: TIME) {
-      id mediaId episode airingAt media { id title { native romaji english } coverImage { medium }
-      episodes nextAiringEpisode { episode airingAt timeUntilAiring } }
+      airedEpisodes: airingSchedule(notYetAired: false, perPage: 50) { nodes { episode airingAt } }
     }
   }
 }"#;
@@ -2137,7 +2143,7 @@ fn season_cache_ttl_millis(season: &str, year: i64, current_year: i64, current_m
     if historical {
         30 * 86_400_000
     } else {
-        6 * 3_600_000
+        24 * 3_600_000
     }
 }
 
@@ -2146,81 +2152,10 @@ async fn anilist_request(
     query: &str,
     variables: Value,
 ) -> anyhow::Result<Value> {
-    anilist_request_at(&context.client, ANILIST_API, query, variables).await
-}
-
-/// 指定端点的 AniList GraphQL 请求（问题 D：季度链的 AniList 补充覆盖需要把
-/// 端点指向可注入的 mock/官方地址）。
-async fn anilist_request_at(
-    client: &reqwest::Client,
-    endpoint: &str,
-    query: &str,
-    variables: Value,
-) -> anyhow::Result<Value> {
-    if endpoint.trim_end_matches('/') == ANILIST_API {
-        loop {
-            let delay = {
-                let mut window = ANILIST_REQUEST_WINDOW.lock().await;
-                let now = Instant::now();
-                while window.front().is_some_and(|timestamp| {
-                    now.duration_since(*timestamp) >= Duration::from_secs(60)
-                }) {
-                    window.pop_front();
-                }
-                if window.len() < ANILIST_SAFE_REQUESTS_PER_MINUTE {
-                    window.push_back(now);
-                    None
-                } else {
-                    window.front().map(|timestamp| {
-                        Duration::from_secs(60).saturating_sub(now.duration_since(*timestamp))
-                    })
-                }
-            };
-            if let Some(delay) = delay {
-                tokio::time::sleep(delay).await;
-            } else {
-                break;
-            }
-        }
-    }
-    let response = client
-        .post(endpoint)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json, multipart/mixed")
-        .header(ORIGIN, "https://anilist.co")
-        .header(REFERER, "https://anilist.co/")
-        .header(
-            reqwest::header::USER_AGENT,
-            "AniLog/0.7 (https://github.com/SH1N15/anilog-tracker)",
-        )
-        .json(&json!({"query": query, "variables": variables}))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let summary = body
-            .replace(['\r', '\n', '\t'], " ")
-            .chars()
-            .take(240)
-            .collect::<String>();
-        let endpoint_label = endpoint
-            .split('?')
-            .next()
-            .unwrap_or(endpoint)
-            .trim_end_matches('/');
-        return Err(anyhow!(
-            "AniList 请求失败（endpoint={endpoint_label}, HTTP {status}, body={summary})"
-        ));
-    }
-    let payload: Value = response.json().await?;
-    if let Some(error) = payload["errors"]
-        .as_array()
-        .and_then(|errors| errors.first())
-    {
-        return Err(anyhow!("{}", value_string(error.get("message"))));
-    }
-    Ok(payload["data"].clone())
+    anilist_cache::request(
+        &context.client, ANILIST_API, query, variables,
+        Some(&context.cache_dir.join("anilist-cache")),
+    ).await
 }
 
 fn season_cache_path(context: &AppContext, season: &str, year: i64) -> PathBuf {
@@ -2291,17 +2226,19 @@ async fn fetch_season_anilist_cached(
     context: &AppContext,
     season: &str,
     year: i64,
+    force: bool,
 ) -> anyhow::Result<(Vec<Value>, i64, bool)> {
     let cache_path = season_cache_path(context, season, year);
     if let Ok(body) = fs::read_to_string(&cache_path) {
         if let Ok(entry) = serde_json::from_str::<Value>(&body) {
             let age = now_millis() - value_i64(entry.get("fetchedAt"));
             let today = Local::now();
-            let ttl =
-                season_cache_ttl_millis(&season, year, i64::from(today.year()), today.month());
+            let ttl = if force { anilist_cache::MANUAL_COOLDOWN * 1000 } else {
+                season_cache_ttl_millis(&season, year, i64::from(today.year()), today.month())
+            };
             if entry.get("version") == Some(&json!(CACHE_VERSION))
                 && entry["anime"].is_array()
-                && age < ttl
+                && age >= 0 && age < ttl
             {
                 return Ok((
                     annotate_anime_sources(
@@ -2318,6 +2255,18 @@ async fn fetch_season_anilist_cached(
         fetch_season_network(context, season, year).await?,
         context.original,
     );
+    for item in &anime {
+        let id = value_i64(item.get("id"));
+        if item["airedEpisodes"]["nodes"].is_array() {
+            let mut media = item.clone();
+            media["futureAiringSchedule"] = item["airingSchedule"].clone();
+            media["airingSchedule"] = item["airedEpisodes"].clone();
+            let _ = anilist_cache::store_snapshot(
+                &context.cache_dir.join("anilist-cache"), id,
+                &anilist_cache::Snapshot { fetched_at: now_seconds(), media },
+            );
+        }
+    }
     let fetched_at = now_millis();
     let entry = json!({"version": CACHE_VERSION, "season": season, "year": year, "fetchedAt": fetched_at, "anime": anime});
     let temporary = cache_path.with_extension("json.tmp");
@@ -2337,6 +2286,44 @@ async fn fetch_season(
     if !["WINTER", "SPRING", "SUMMER", "FALL"].contains(&season.as_str()) || year < 1900 {
         return Err("无效的季度参数".into());
     }
+    let force = value_bool(params.get("force"));
+    if !force {
+        if let Some((anime, fetched_at)) = read_season_snapshot(&context, &season, year) {
+            let today = Local::now();
+            let ttl = season_cache_ttl_millis(&season, year, i64::from(today.year()), today.month());
+            if now_millis().saturating_sub(fetched_at) >= ttl {
+                let context = context.inner().clone();
+                let app = app.clone();
+                let season = season.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = refresh_season(&app, &context, &season, year, false).await;
+                });
+            }
+            return Ok(anime);
+        }
+    }
+    refresh_season(&app, &context, &season, year, force).await
+}
+
+fn read_season_snapshot(context: &AppContext, season: &str, year: i64) -> Option<(Vec<Value>, i64)> {
+    #[cfg(feature = "standard")]
+    if !context.original {
+        let directory = bangumi_cache_dir(context);
+        if let Some((anime, at)) = read_bangumi_season_cache(&directory.join(format!("{year}-{season}.json")), false) {
+            return Some((normalize_season_anime_episode_authority(&directory, anime, now_seconds()), at));
+        }
+    }
+    let raw = fs::read(season_cache_path(context, season, year)).ok()?;
+    let entry: Value = serde_json::from_slice(&raw).ok()?;
+    let at = entry["fetchedAt"].as_i64()?;
+    if entry["version"] != CACHE_VERSION || at <= 0 || at > now_millis() { return None; }
+    Some((annotate_anime_sources(entry["anime"].as_array()?.clone(), context.original), at))
+}
+
+async fn refresh_season(
+    app: &AppHandle, context: &AppContext, season: &str, year: i64, force: bool,
+) -> Result<Vec<Value>, String> {
+    let _guard = SEASON_REFRESH_GATE.lock().await;
     // standard 版季度主链（Phase 2）：Bangumi /v0/subjects 分页 → 映射 →
     // bangumi-cache → 失败回落过期缓存 → 连缓存都没有再回落下方 AniList
     // 原路径（原逻辑零变化）。original 不进入该分支，行为完全不变。
@@ -2348,68 +2335,12 @@ async fn fetch_season(
             (state.clone(), base)
         };
         let cache_dir = bangumi_cache_dir(&context);
-        // Cache-first season loading: an expired but valid snapshot is useful
-        // immediately.  Refresh in the background and notify the UI when the
-        // new snapshot is ready instead of blocking the first screen for all
-        // month pages plus AniList enrichment.
-        if let Some((cached_anime, cached_at)) =
-            read_bangumi_season_cache(&cache_dir.join(format!("{year}-{season}.json")), false)
-        {
-            if now_millis().saturating_sub(cached_at) >= BANGUMI_SEASON_TTL_MILLIS {
-                let stale_anime = normalize_season_anime_episode_authority(
-                    &cache_dir,
-                    cached_anime,
-                    now_seconds(),
-                );
-                let refresh_context = context.inner().clone();
-                let refresh_app = app.clone();
-                let refresh_season = season.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state_snapshot = match refresh_context.state.lock() {
-                        Ok(state) => state.clone(),
-                        Err(_) => return,
-                    };
-                    let base = bangumi_base_urls(&state_snapshot);
-                    let source = AniListSeasonSource {
-                        client: &refresh_context.client,
-                        endpoint: ANILIST_API,
-                    };
-                    if let SeasonFetch::Bangumi {
-                        anime,
-                        fetched_at,
-                        stale,
-                    } = fetch_season_bangumi_chain(
-                        &refresh_context.client,
-                        base,
-                        &cache_dir,
-                        &refresh_context.offline_bangumi,
-                        &state_snapshot,
-                        &refresh_season,
-                        year,
-                        Some(&source),
-                    )
-                    .await
-                    {
-                        let _ = refresh_app.emit(
-                            "season-updated",
-                            json!({
-                                "season": refresh_season,
-                                "year": year,
-                                "anime": anime,
-                                "fetchedAt": fetched_at,
-                                "stale": stale
-                            }),
-                        );
-                    }
-                });
-                return Ok(stale_anime);
-            }
-        }
         let anilist_source = AniListSeasonSource {
             client: &context.client,
             endpoint: ANILIST_API,
+            cache_dir: context.cache_dir.join("anilist-cache"),
         };
-        match fetch_season_bangumi_chain(
+        match fetch_season_bangumi_chain_with_policy(
             &context.client,
             base,
             &cache_dir,
@@ -2418,6 +2349,7 @@ async fn fetch_season(
             &season,
             year,
             Some(&anilist_source),
+            force,
         )
         .await
         {
@@ -2440,9 +2372,18 @@ async fn fetch_season(
             }
         }
     }
-    let (anime, fetched_at, cached) = fetch_season_anilist_cached(&context, &season, year)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (anime, fetched_at, cached) = match fetch_season_anilist_cached(context, season, year, force).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some((anime, at)) = read_season_snapshot(context, season, year) {
+                let _ = app.emit("season-updated", json!({
+                    "season": season, "year": year, "anime": anime, "fetchedAt": at, "stale": true
+                }));
+                return Ok(anime);
+            }
+            return Err(error.to_string());
+        }
+    };
     if !cached {
         let _ = app.emit(
             "season-updated",
@@ -2467,25 +2408,13 @@ const BANGUMI_SEASON_TTL_MILLIS: i64 = 24 * 3_600_000;
 #[cfg(feature = "standard")]
 const BANGUMI_SEASON_MAX_PAGES_PER_MONTH: usize = 10;
 
-/// 问题 D ①：AniList 补充覆盖查询（按 id_in 批量，分页 ≤3 页）。
-#[cfg(feature = "standard")]
-const SEASON_ANILIST_ENRICH_QUERY: &str = r#"query SeasonAniListEnrich($ids: [Int], $page: Int) {
-  Page(page: $page, perPage: 50) { pageInfo { lastPage }
-    media(id_in: $ids, type: ANIME) {
-      id status episodes duration genres averageScore bannerImage
-      studios(isMain: true) { nodes { name } }
-      nextAiringEpisode { episode airingAt timeUntilAiring }
-      airingSchedule(notYetAired: true, perPage: 50) { nodes { episode airingAt } }
-    }
-  }
-}"#;
-
 /// AniList 补充覆盖的请求来源（生产 = AppContext 客户端 + 官方 GraphQL 端点；
 /// 测试 = mock 服务器），使季度链可注入而不触网。
 #[cfg(feature = "standard")]
 struct AniListSeasonSource<'a> {
     client: &'a reqwest::Client,
     endpoint: &'a str,
+    cache_dir: PathBuf,
 }
 
 /// 问题 D ①：季度链内 AniList 补充覆盖。对条目 anilistId（离线映射反查）批量
@@ -2498,71 +2427,41 @@ struct AniListSeasonSource<'a> {
 async fn anilist_enrich_season_anime(
     source: &AniListSeasonSource<'_>,
     mut anime: Vec<Value>,
+    force: bool,
 ) -> Vec<Value> {
-    let ids: Vec<i64> = anime
+    let ids: BTreeMap<i64, i64> = anime
         .iter()
         .map(|item| value_i64(item.get("anilistId")))
         .filter(|id| *id > 0)
-        .collect::<HashSet<_>>()
-        .into_iter()
+        .map(|id| (id, anilist_cache::DAY))
         .collect();
     if ids.is_empty() {
         return anime;
     }
-    let mut media_by_id: HashMap<i64, Value> = HashMap::new();
-    for page in 1..=3usize {
-        let data = match anilist_request_at(
-            source.client,
-            source.endpoint,
-            SEASON_ANILIST_ENRICH_QUERY,
-            json!({"ids": ids, "page": page}),
-        )
-        .await
-        {
-            Ok(data) => data,
-            Err(error) => {
-                warn!("AniList 季度补充覆盖失败（静默保留 bangumi-data 值）：{error}");
-                return anime;
-            }
-        };
-        let last_page = value_i64(data["Page"]["pageInfo"].get("lastPage")).clamp(1, 3) as usize;
-        for media in data["Page"]["media"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            let id = value_i64(media.get("id"));
-            if id > 0 {
-                media_by_id.insert(id, media);
-            }
-        }
-        if page >= last_page {
-            break;
-        }
-    }
+    let batch = anilist_cache::media(source.client, source.endpoint, &source.cache_dir, &ids, force, now_seconds()).await;
+    let media_by_id = batch.snapshots;
     if media_by_id.is_empty() {
         return anime;
     }
     for item in anime.iter_mut() {
         let anilist_id = value_i64(item.get("anilistId"));
-        let Some(media) = media_by_id.get(&anilist_id) else {
+        let Some(snapshot) = media_by_id.get(&anilist_id) else {
             continue;
         };
+        let media = &snapshot.media;
+        if !media.is_object() { continue; }
         // nextAiringEpisode：AniList 权威；完结/取消或无下一期 → null。
         let status = value_string(media.get("status"));
         let finished = matches!(status.as_str(), "FINISHED" | "CANCELLED");
-        let next = media
-            .get("nextAiringEpisode")
-            .cloned()
-            .unwrap_or(Value::Null);
-        item["nextAiringEpisode"] = if finished || next.is_null() {
+        let next = anilist_cache::next_episode(media, now_seconds());
+        item["nextAiringEpisode"] = if finished || !snapshot.precise(now_seconds()) || next.is_null() {
             Value::Null
         } else {
             next
         };
         // airingSchedule：前端星期分组依赖；AniList 无数据时保留原值。
-        let schedule = media.get("airingSchedule").cloned().unwrap_or(Value::Null);
-        if schedule["nodes"].is_array() && !schedule["nodes"].as_array().unwrap().is_empty() {
+        let schedule = media.get("futureAiringSchedule").cloned().unwrap_or(Value::Null);
+        if snapshot.precise(now_seconds()) && schedule["nodes"].is_array() && !schedule["nodes"].as_array().unwrap().is_empty() {
             item["airingSchedule"] = schedule;
         }
         // 补充字段：只补缺（null / 空数组 / 空串），不覆盖 bangumi 已有值。
@@ -2620,7 +2519,7 @@ enum SeasonFetch {
 /// standard 版季度主链核心（测试经 MockBangumiServer 直调；`state` 为
 /// context.state 快照，用于读 preferredBroadcastSites）。`anilist` 为问题 D ①
 /// 的 AniList 补充覆盖来源（生产注入官方端点，测试可注入 mock 或 None 跳过）。
-#[cfg(feature = "standard")]
+#[cfg(all(test, feature = "standard"))]
 async fn fetch_season_bangumi_chain(
     client: &reqwest::Client,
     base: bangumi::BangumiBaseUrls,
@@ -2631,14 +2530,28 @@ async fn fetch_season_bangumi_chain(
     year: i64,
     anilist: Option<&AniListSeasonSource<'_>>,
 ) -> SeasonFetch {
+    fetch_season_bangumi_chain_with_policy(client, base, cache_dir, offline_map, state, season, year, anilist, false).await
+}
+
+#[cfg(feature = "standard")]
+async fn fetch_season_bangumi_chain_with_policy(
+    client: &reqwest::Client, base: bangumi::BangumiBaseUrls, cache_dir: &Path,
+    offline_map: &Value, state: &Value, season: &str, year: i64,
+    anilist: Option<&AniListSeasonSource<'_>>, force: bool,
+) -> SeasonFetch {
     let cache_path = cache_dir.join(format!("{year}-{season}.json"));
     // 1. 缓存命中（TTL 24h）：直接返回。
-    if let Some((anime, fetched_at)) = read_bangumi_season_cache(&cache_path, true) {
-        return SeasonFetch::Bangumi {
-            anime: normalize_season_anime_episode_authority(cache_dir, anime, now_seconds()),
-            fetched_at,
-            stale: false,
+    if let Some((anime, fetched_at)) = read_bangumi_season_cache(&cache_path, false) {
+        let today = Local::now();
+        let ttl = if force { 60_000 } else {
+            season_cache_ttl_millis(season, year, i64::from(today.year()), today.month())
         };
+        if now_millis() >= fetched_at && now_millis() - fetched_at < ttl {
+            return SeasonFetch::Bangumi {
+                anime: normalize_season_anime_episode_authority(cache_dir, anime, now_seconds()),
+                fetched_at, stale: false,
+            };
+        }
     }
     // 2. 网络刷新：三个月逐月分页拉取。
     let http = bangumi::HttpBangumiClient::new(client.clone(), base);
@@ -2656,7 +2569,7 @@ async fn fetch_season_bangumi_chain(
             // 问题 D ①：AniList 补充覆盖（nextAiringEpisode 权威 / airingSchedule
             // 填入 / 补充字段；失败静默保留 bangumi-data 值）。随缓存一并落盘。
             if let Some(source) = anilist {
-                anime = anilist_enrich_season_anime(source, anime).await;
+                anime = anilist_enrich_season_anime(source, anime, force).await;
             }
             anime = normalize_season_anime_episode_authority(cache_dir, anime, now_seconds());
             let fetched_at = now_millis();
@@ -3105,13 +3018,20 @@ fn map_subjects_to_anime(
 }
 
 #[tauri::command]
-fn get_state(_app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
+async fn get_state(_app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
     #[cfg(target_os = "android")]
-    mobile::consume_events(&_app, &context).map_err(|error| error.to_string())?;
-    // Phase 4 任务 2：Android 前台过期检查（进程内标志 + single-flight 防重复，
-    // spawn 后台补偿、不阻塞返回；original edition 不编译此行，桌面零变化）。
-    #[cfg(all(feature = "standard", target_os = "android"))]
-    maybe_spawn_foreground_sync(&_app, &context);
+    {
+        let context = context.inner().clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            if mobile::consume_events(&_app, &context).is_err() {
+                warn!("native state refresh unavailable; retaining the loaded local snapshot");
+            }
+            #[cfg(feature = "standard")]
+            maybe_spawn_foreground_sync(&_app, &context);
+            context.public_state()
+        }).await.map_err(|_| "无法读取本地状态".to_string());
+    }
+    #[cfg(not(target_os = "android"))]
     Ok(context.public_state())
 }
 
@@ -3515,6 +3435,8 @@ fn toggle_follow(
 ) -> Result<Value, String> {
     let id = value_i64(anime.get("id"));
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+    let before: HashSet<i64> = state["following"].as_array().into_iter().flatten()
+        .map(|entry| value_i64(entry.get("id"))).collect();
     if !remove_following(&mut state, id) {
         add_following_entry(
             &mut state,
@@ -3523,6 +3445,10 @@ fn toggle_follow(
             &context.offline_bangumi,
         );
     }
+    let added: Vec<Value> = state["following"].as_array().into_iter().flatten()
+        .filter(|entry| !before.contains(&value_i64(entry.get("id")))).cloned().collect();
+    #[cfg(not(target_os = "android"))]
+    hydrate_cached_follow_schedules(&mut state, &context.cache_dir, context.original, &added, now_seconds());
     drop(state);
     context.save_state().map_err(|error| error.to_string())?;
     context.webdav_wakeup.notify_one();
@@ -3531,7 +3457,71 @@ fn toggle_follow(
     notify_bangumi_sync_wakeup(true);
     refresh_mobile_configuration(&app, &context)?;
     emit_state(&app, &context);
+    refresh_new_follow_schedules(&app, &context, added);
     Ok(context.public_state())
+}
+
+#[tauri::command]
+fn unfollow(
+    app: AppHandle,
+    context: State<'_, AppContext>,
+    anime_id: i64,
+) -> Result<Value, String> {
+    if anime_id <= 0 {
+        return Err("无效的追番条目".into());
+    }
+    {
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        remove_following(&mut state, anime_id);
+    }
+    context.save_state().map_err(|error| error.to_string())?;
+    context.webdav_wakeup.notify_one();
+    notify_bangumi_sync_wakeup(true);
+    refresh_mobile_configuration(&app, &context)?;
+    emit_state(&app, &context);
+    Ok(context.public_state())
+}
+
+fn refresh_new_follow_schedules(app: &AppHandle, context: &AppContext, added: Vec<Value>) {
+    if added.is_empty() { return; }
+    let app = app.clone();
+    let context = context.clone();
+    tauri::async_runtime::spawn(async move {
+        #[cfg(not(target_os = "android"))]
+        {
+            let ids = added.iter().map(|entry| value_i64(entry.get("id"))).collect();
+            let _ = sync_schedules(&app, &context, true, Some(ids)).await;
+        }
+        #[cfg(target_os = "android")]
+        for entry in added {
+            let _ = mobile::sync_native_with_policy(&app, &context, true, value_i64(entry.get("id")));
+        }
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn hydrate_cached_follow_schedules(
+    state: &mut Value, cache_dir: &Path, original: bool, entries: &[Value], now: i64,
+) {
+    for entry in entries {
+        let id = value_i64(entry.get("id"));
+        #[cfg(feature = "standard")]
+        if !original && entry["source"] == "bangumi" {
+            let directory = cache_dir.join("bangumi-cache");
+            if let Some(records) = bangumi_episode_records_from_cache(&directory, id, now, i64::MAX) {
+                let precision = anilist_precise_airing_from_cache(&directory, value_i64(entry.get("anilistId")), now);
+                apply_bangumi_episode_records_to_state(state, id, &records, now, false, Some(&precision));
+            }
+            continue;
+        }
+        let Some(media_id) = anilist_cache::media_id(entry, original) else { continue };
+        let Some(snapshot) = anilist_cache::read_snapshot(&cache_dir.join("anilist-cache"), media_id)
+            .filter(|snapshot| snapshot.precise(now)) else { continue };
+        if let Some(item) = state["following"].as_array_mut().into_iter().flatten()
+            .find(|item| value_i64(item.get("id")) == id) {
+            item["nextAiringEpisode"] = anilist_cache::next_episode(&snapshot.media, now);
+        }
+    }
 }
 
 #[tauri::command]
@@ -3588,6 +3578,10 @@ fn toggle_task_status(task: &mut Value) -> bool {
     };
     task["syncUpdatedAt"] = json!(now_millis());
     let newly_completed = !completed;
+    if task["completionReview"].is_object() {
+        task["completionReview"]["decision"] = json!(if newly_completed { "keep" } else { "reset" });
+        task["completionReview"]["resolvedAt"] = json!(now_millis());
+    }
     #[cfg(feature = "standard")]
     if value_i64(task.get("subjectId")) > 0 {
         task["lastChangedBy"] = json!("local");
@@ -3598,33 +3592,12 @@ fn toggle_task_status(task: &mut Value) -> bool {
 
 #[cfg(feature = "standard")]
 fn completed_progress(state: &Value, entry: &Value) -> i64 {
-    let subject = value_i64(entry.get("id"));
-    let total = value_i64(entry.get("episodes"));
-    state["tasks"].as_array().into_iter().flatten()
-        .filter(|task| {
-            let episode = value_i64(task.get("episode"));
-            (value_i64(task.get("subjectId")) == subject || value_i64(task.get("animeId")) == subject)
-                && value_string(task.get("status")) == "completed"
-                && episode > 0 && (total <= 0 || episode <= total)
-        })
-        .map(|task| value_i64(task.get("episode")))
-        .collect::<HashSet<_>>().len() as i64
+    watch_history::completed_count(state, entry, false)
 }
 
 #[cfg(feature = "standard")]
 fn heal_following_progress(state: &mut Value) {
-    let counts: Vec<(usize, i64)> = state["following"].as_array().into_iter().flatten()
-        .enumerate()
-        .filter(|(_, entry)| value_string(entry.get("source")) == "bangumi"
-            && entry.get("watchedEpisode").is_some_and(Value::is_number))
-        .map(|(index, entry)| (index, completed_progress(state, entry)))
-        .collect();
-    for (index, count) in counts {
-        if count > value_i64(state["following"][index].get("watchedEpisode")) {
-            state["following"][index]["watchedEpisode"] = json!(count);
-            state["following"][index]["syncUpdatedAt"] = json!(now_millis());
-        }
-    }
+    watch_history::reconcile(state, now_seconds());
 }
 
 #[cfg(feature = "standard")]
@@ -3646,7 +3619,7 @@ fn update_progress_after_task_toggle(state: &mut Value, task: &Value) {
         other.get("id") != task.get("id")
             && (value_i64(other.get("subjectId")) == subject || value_i64(other.get("animeId")) == subject)
             && value_i64(other.get("episode")) == episode
-            && value_string(other.get("status")) == "completed");
+            && watch_history::is_completed(other));
     let delta = if duplicate_completed { 0 } else if value_string(task.get("status")) == "completed" { 1 } else { -1 };
     let count = completed_progress(state, entry);
     let previous = entry.get("watchedEpisode").and_then(Value::as_i64).unwrap_or(count - delta);
@@ -3741,6 +3714,12 @@ fn toggle_task(
             .iter_mut()
             .find(|task| value_string(task.get("id")) == task_id)
     }) {
+        if watch_history::needs_review(task) {
+            return Err("请先核对这条观看记录".into());
+        }
+        if watch_history::is_reset(task) && watch_history::is_future(task, now_seconds()) {
+            return Err("这集尚未播出".into());
+        }
         let _newly_completed = toggle_task_status(task);
         bangumi_task_changed = value_i64(task.get("subjectId")) > 0;
         // 快照后任务借用即终结，才能再借 &mut state 做条目级完结转换。
@@ -3767,6 +3746,28 @@ fn toggle_task(
     // 问题 2b：bangumi 任务完成 → 动作唤醒桌面自动同步（写回单集进度）。
     notify_bangumi_sync_wakeup(bangumi_task_changed);
     refresh_mobile_configuration(&app, &context)?;
+    emit_state(&app, &context);
+    Ok(context.public_state())
+}
+
+#[tauri::command]
+fn resolve_task_review(
+    app: AppHandle, context: State<'_, AppContext>, task_id: String, keep_completed: bool,
+) -> Result<Value, String> {
+    {
+        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        #[cfg(feature = "standard")]
+        heal_following_progress(&mut state);
+        let task = state["tasks"].as_array_mut().into_iter().flatten()
+            .find(|task| value_string(task.get("id")) == task_id).ok_or("观看记录不存在")?;
+        watch_history::resolve(task, keep_completed, now_seconds())?;
+        #[cfg(feature = "standard")]
+        heal_following_progress(&mut state);
+    }
+    context.save_state().map_err(|error| error.to_string())?;
+    refresh_mobile_configuration(&app, &context)?;
+    context.webdav_wakeup.notify_one();
+    notify_bangumi_sync_wakeup(true);
     emit_state(&app, &context);
     Ok(context.public_state())
 }
@@ -3872,12 +3873,13 @@ fn is_valid_reminder_time(time: &str) -> bool {
 async fn sync_now(app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
     #[cfg(target_os = "android")]
     {
-        let status = mobile::sync_native(&app, &context).map_err(|error| error.to_string())?;
+        let status = mobile::sync_native_with_policy(&app, &context, true, 0).map_err(|error| error.to_string())?;
         let created = value_i64(status.get("created"));
-        return Ok(json!({"created": created, "syncedAt": value_i64(status.get("syncedAt"))}));
+        return Ok(json!({"created": created, "syncedAt": value_i64(status.get("syncedAt")),
+            "warning": value_string(status.get("warning"))}));
     }
     #[cfg(not(target_os = "android"))]
-    sync_now_inner(&app, &context).await
+    sync_schedules(&app, &context, true, None).await
 }
 
 #[cfg(not(target_os = "android"))]
@@ -4399,12 +4401,13 @@ async fn load_bangumi_episode_records(
     client: &bangumi::HttpBangumiClient,
     subject_id: i64,
     now: i64,
+    force: bool,
 ) -> Option<Vec<bangumi::BangumiEpisode>> {
     if let Some(records) = bangumi_episode_records_from_cache(
         &bangumi_cache_dir(context),
         subject_id,
         now,
-        BANGUMI_EPISODES_CACHE_TTL_SECONDS,
+        if force { anilist_cache::MANUAL_COOLDOWN } else { BANGUMI_EPISODES_CACHE_TTL_SECONDS },
     ) {
         return Some(records);
     }
@@ -4474,6 +4477,19 @@ fn anilist_precise_airing_from_cache(
     if anilist_id <= 0 {
         return HashMap::new();
     }
+    if let Some(snapshot) = anilist_cache::read_snapshot(
+        &cache_dir.parent().unwrap_or(cache_dir).join("anilist-cache"), anilist_id,
+    ) {
+        if !snapshot.precise(now) { return HashMap::new(); }
+        return snapshot.media["airingSchedule"]["nodes"].as_array().into_iter().flatten()
+            .chain(snapshot.media["futureAiringSchedule"]["nodes"].as_array().into_iter().flatten())
+            .chain(snapshot.media.get("nextAiringEpisode"))
+            .filter_map(|node| {
+                let episode = value_i64(node.get("episode"));
+                let at = value_i64(node.get("airingAt"));
+                (episode > 0 && at > 0).then_some((episode, at))
+            }).collect();
+    }
     let Ok(raw) = fs::read_to_string(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE)) else {
         return HashMap::new();
     };
@@ -4514,12 +4530,60 @@ fn anilist_precise_airing_from_cache(
 }
 
 #[cfg(all(feature = "standard", not(target_os = "android")))]
+fn same_episode_calendar_date(date: &str, at: i64) -> bool {
+    at > 0 && [0, 8 * 3600].into_iter().any(|offset| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(at.saturating_add(offset), 0)
+            .is_some_and(|value| value.date_naive().to_string() == date)
+    })
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn anilist_uses_subject_episode_numbers(
+    records: &[bangumi::BangumiEpisode],
+    precise: &HashMap<i64, i64>,
+    now: i64,
+) -> bool {
+    let mut confirmed = HashSet::new();
+    for record in records.iter().filter(|record| record.ep_type == 0) {
+        let Some(local) = bangumi_sync::episode_number(record) else { continue };
+        let Some(global) = record.sort.and_then(bangumi_sync::episode_sort_key) else { continue };
+        if local == global { continue; }
+        let Some(date) = record.airdate.as_deref().and_then(|date| date.get(..10)) else { continue };
+        if bangumi_episode_airdate_is_aired(date, now) != Some(true) { continue; }
+        if records.iter().filter(|row| row.ep_type == 0
+            && row.airdate.as_deref().and_then(|date| date.get(..10)) == Some(date)).count() != 1 {
+            continue;
+        }
+        let candidates: Vec<i64> = precise.iter()
+            .filter(|(_, at)| **at <= now && same_episode_calendar_date(date, **at))
+            .map(|(episode, _)| *episode).collect();
+        if candidates.len() == 1 {
+            if candidates[0] != local { return false; }
+            confirmed.insert(local);
+        }
+    }
+    // Independent seasons may restart AniList numbering even when Bangumi's
+    // sort continues the whole series. Require two unambiguous date anchors;
+    // one coincidental match cannot rebind a shared/split AniList season.
+    confirmed.len() >= 2
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
 fn bangumi_episode_schedule_with_precision(
     records: &[bangumi::BangumiEpisode],
     now: i64,
     precise: &HashMap<i64, i64>,
 ) -> Vec<(i64, i64, i64, bool)> {
     let mut schedule = bangumi_episode_schedule(records, now);
+    let mut seen: HashSet<i64> = schedule.iter().map(|row| row.0).collect();
+    for record in records.iter().filter(|record| record.id > 0 && record.ep_type == 0) {
+        if let Some(episode) = bangumi_sync::episode_number(record) {
+            if seen.insert(episode) {
+                schedule.push((episode, record.id, 0, false));
+            }
+        }
+    }
+    let uses_local_numbers = anilist_uses_subject_episode_numbers(records, precise, now);
     for (episode, _, airing_at, aired) in &mut schedule {
         // Usually AniList and Bangumi use the same episode number. For split
         // subjects they do not: AniList may expose the global continuation
@@ -4543,12 +4607,7 @@ fn bangumi_episode_schedule_with_precision(
             let Some(date) = record_date else {
                 return false;
             };
-            chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
-                .map(|value| value.date_naive().to_string() == date)
-                .unwrap_or(false)
-                || chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp + 8 * 3600, 0)
-                    .map(|value| value.date_naive().to_string() == date)
-                    .unwrap_or(false)
+            same_episode_calendar_date(date, timestamp)
         };
         let is_split_subject = local_and_global.is_some_and(|(local, global)| local != global);
         let calendar_candidate = || {
@@ -4566,7 +4625,7 @@ fn bangumi_episode_schedule_with_precision(
         // global number; otherwise pair by calendar date so a season-local
         // AniList numbering scheme (e.g. AniList ep=16) still maps to the
         // correct Bangumi ep=5 after a split.
-        let candidate = if is_split_subject {
+        let candidate = if is_split_subject && !uses_local_numbers {
             local_and_global
                 .and_then(|(_, global)| precise.get(&global).copied())
                 .or_else(calendar_candidate)
@@ -4592,6 +4651,8 @@ fn bangumi_episode_schedule_with_precision(
             *aired = candidate <= now;
         }
     }
+    schedule.retain(|row| row.2 > 0);
+    schedule.sort_by_key(|row| row.0);
     schedule
 }
 
@@ -4719,7 +4780,7 @@ fn apply_bangumi_episode_records_to_state(
             return true;
         };
         let instant = resolved_airing_is_precise(records, episode_id, airing_at, precise);
-        if !completed && !aired && (instant || airing_at / 86_400 > now / 86_400) {
+        if !completed && !watch_history::is_reset(task) && !aired && (instant || airing_at / 86_400 > now / 86_400) {
             changed = true;
             return false;
         }
@@ -4749,6 +4810,7 @@ fn apply_bangumi_episode_records_to_state(
             task["airingPrecision"] = json!("instant");
             changed = true;
         }
+        changed |= watch_history::review_future_completion(task, now);
         if let Some(object) = task.as_object_mut() {
             if object.remove("needsScheduleReview").is_some()
                 || object.remove("scheduleReviewReason").is_some()
@@ -4788,11 +4850,14 @@ fn apply_bangumi_episode_records_to_state(
             changed = true;
         }
     }
+    changed |= watch_history::reconcile(state, now);
     changed
 }
 
 #[cfg(all(feature = "standard", not(target_os = "android")))]
-async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool {
+async fn apply_bangumi_episode_authority(
+    context: &AppContext, now: i64, force: bool, only: Option<&HashSet<i64>>,
+) -> bool {
     let base = {
         let Ok(state) = context.state.lock() else {
             return false;
@@ -4800,6 +4865,14 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
         bangumi_base_urls(&state)
     };
     let http = bangumi::HttpBangumiClient::new(context.client.clone(), base);
+    apply_bangumi_episode_authority_with_client(context, &http, now, force, only).await
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+async fn apply_bangumi_episode_authority_with_client(
+    context: &AppContext, http: &bangumi::HttpBangumiClient,
+    now: i64, force: bool, only: Option<&HashSet<i64>>,
+) -> bool {
     let entries: Vec<Value> = {
         let Ok(state) = context.state.lock() else {
             return false;
@@ -4810,6 +4883,7 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
             .unwrap_or_default()
             .into_iter()
             .filter(|entry| value_string(entry.get("source")) == "bangumi")
+            .filter(|entry| only.is_none_or(|ids| ids.contains(&value_i64(entry.get("id")))))
             .collect()
     };
     let create_tasks = context
@@ -4824,7 +4898,7 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
         if subject_id <= 0 {
             continue;
         }
-        let Some(records) = load_bangumi_episode_records(context, &http, subject_id, now).await
+        let Some(records) = load_bangumi_episode_records(context, http, subject_id, now, force).await
         else {
             continue;
         };
@@ -4930,7 +5004,7 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 return true;
             };
             let instant = resolved_airing_is_precise(&records, episode_id, airing_at, Some(&precise));
-            if value_string(task.get("status")) == "pending" && !aired
+            if value_string(task.get("status")) == "pending" && !watch_history::is_reset(task) && !aired
                 && (instant || airing_at / 86_400 > now / 86_400)
             {
                 changed = true;
@@ -4966,6 +5040,7 @@ async fn apply_bangumi_episode_authority(context: &AppContext, now: i64) -> bool
                 task["airingPrecision"] = json!("instant");
                 changed = true;
             }
+            changed |= watch_history::review_future_completion(task, now);
             true
         });
         if create_tasks && tracking {
@@ -5049,20 +5124,9 @@ fn apply_cached_bangumi_episode_authority(state: &mut Value, cache_dir: &Path, n
 /// 权威全量重写查询（与 AIRING_QUERY 的窗口语义解耦）：nextAiringEpisode +
 /// 已播 airingSchedule（notYetAired:false，TIME_DESC 取最近 25 集）。分页
 /// ≤3（perPage 50 → 单轮 ≤150 条目）。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
-const ANILIST_AUTHORITY_QUERY: &str = r#"query AniListAuthority($ids: [Int], $page: Int) {
-  Page(page: $page, perPage: 50) { pageInfo { lastPage }
-    media(id_in: $ids, type: ANIME) {
-      id
-      nextAiringEpisode { episode airingAt }
-      airingSchedule(notYetAired: false, perPage: 50) { nodes { episode airingAt } }
-    }
-  }
-}"#;
-
 /// 抓取 AniList 权威 media（anilistId → media）。任一页失败（网络/解析/GraphQL
 /// errors）静默 None——调用方整体放弃本轮应用（不做半套改写）。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+#[cfg(all(test, feature = "standard", not(target_os = "android")))]
 async fn fetch_anilist_authority_media(
     client: &reqwest::Client,
     endpoint: &str,
@@ -5071,32 +5135,7 @@ async fn fetch_anilist_authority_media(
     if ids.is_empty() {
         return None;
     }
-    let mut media_by_id: HashMap<i64, Value> = HashMap::new();
-    for page in 1..=3usize {
-        let data = anilist_request_at(
-            client,
-            endpoint,
-            ANILIST_AUTHORITY_QUERY,
-            json!({"ids": ids, "page": page}),
-        )
-        .await
-        .ok()?;
-        let last_page = value_i64(data["Page"]["pageInfo"].get("lastPage")).clamp(1, 3) as usize;
-        for media in data["Page"]["media"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            let id = value_i64(media.get("id"));
-            if id > 0 {
-                media_by_id.insert(id, media);
-            }
-        }
-        if page >= last_page {
-            break;
-        }
-    }
-    Some(media_by_id)
+    anilist_cache::fetch_media(client, endpoint, ids, None).await.ok()
 }
 
 /// 权威数据应用（纯同步，易测）：对每个 media 定位主认领条目
@@ -5386,7 +5425,7 @@ fn apply_anilist_authority_media_inner(
 /// 再持锁应用（持锁段内无 await）。失败（网络/解析/锁）静默 false。state 为
 /// 共享状态锁本体，await 只发生在抓取段。
 /// Android applies its per-subject episode schedule through the native snapshot.
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+#[cfg(all(test, feature = "standard", not(target_os = "android")))]
 async fn anilist_authority_refresh(
     state: &Mutex<Value>,
     map: &Value,
@@ -5424,7 +5463,7 @@ const ANILIST_PRECISE_AIRING_CACHE_MAX_AGE_SECS: i64 = 7 * 86_400;
 
 /// 第 8 轮问题 1：抓取成功的权威 media 序列化落盘（毫秒时间戳 + 原始 JSON
 /// 数组，与 AniList 响应同形，重放无需任何转换）。
-#[cfg(all(feature = "standard", not(target_os = "android")))]
+#[cfg(all(test, feature = "standard", not(target_os = "android")))]
 fn write_anilist_authority_cache(cache_dir: &Path, media_by_id: &HashMap<i64, Value>) {
     let cache = json!({
         "fetchedAt": now_millis(),
@@ -5450,6 +5489,17 @@ fn apply_cached_anilist_authority_with_mode(
     now: i64,
     skip_bangumi_entries: bool,
 ) -> bool {
+    let snapshots: HashMap<i64, Value> = anilist_cache::following_requests(state, false, 300)
+        .keys().filter_map(|&id| {
+            let snapshot = anilist_cache::read_snapshot(
+                &cache_dir.parent().unwrap_or(cache_dir).join("anilist-cache"), id,
+            )?;
+            anilist_cache::fresh(snapshot.fetched_at, now, ANILIST_AUTHORITY_HEAL_CACHE_TTL_SECS)
+                .then_some((id, snapshot.media))
+        }).collect();
+    if !snapshots.is_empty() {
+        return apply_anilist_authority_media_inner(state, map, &snapshots, now, skip_bangumi_entries);
+    }
     let Ok(raw) = fs::read_to_string(cache_dir.join(ANILIST_AUTHORITY_CACHE_FILE)) else {
         return false;
     };
@@ -5491,158 +5541,49 @@ fn apply_cached_anilist_authority(
 
 #[cfg(not(target_os = "android"))]
 async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, String> {
-    let (ids, from) = {
+    sync_schedules(app, context, false, None).await
+}
+
+#[cfg(not(target_os = "android"))]
+async fn sync_schedules(
+    app: &AppHandle, context: &AppContext, force: bool, only: Option<HashSet<i64>>,
+) -> Result<Value, String> {
+    let _guard = context.schedule_sync_lock.lock().await;
+    let (requests, known) = {
         let state = context.state.lock().map_err(|_| "状态锁不可用")?;
+        let selected: Vec<&Value> = state["following"].as_array().into_iter().flatten()
+            .filter(|entry| only.as_ref().is_none_or(|ids| ids.contains(&value_i64(entry.get("id")))))
+            .collect();
         (
-            state["following"]
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .map(|item| {
-                    // 主键迁移后 bangumi 来源条目按 anilistId 查询 AniList。
-                    let id = value_i64(item.get("id"));
-                    if value_string(item.get("source")) == "bangumi"
-                        && value_i64(item.get("anilistId")) > 0
-                    {
-                        value_i64(item.get("anilistId"))
-                    } else {
-                        id
-                    }
-                })
-                .filter(|id| *id > 0)
-                .collect::<Vec<_>>(),
-            value_i64(state.get("lastSyncAt")),
+            anilist_cache::following_requests(&json!({"following": selected}), context.original,
+                value_i64(state["settings"].get("pollIntervalMinutes")).clamp(1, 1440) * 60),
+            state["tasks"].as_array().into_iter().flatten()
+                .map(|task| value_string(task.get("id"))).collect::<HashSet<_>>(),
         )
     };
-    // 权威数据修复：共享 anilistId（分季课程共占一个 AniList 条目）只查一次。
-    let mut ids = ids;
-    ids.sort_unstable();
-    ids.dedup();
     let now = now_seconds();
-    if ids.is_empty() {
+    let batch = anilist_cache::media(
+        &context.client, ANILIST_API, &context.cache_dir.join("anilist-cache"),
+        &requests, force, now,
+    ).await;
+    let mut outcome = {
         let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-        state["lastSyncAt"] = json!(now);
-        drop(state);
-        context.save_state().map_err(|error| error.to_string())?;
-        emit_state(app, context);
-        return Ok(json!({"created": 0, "syncedAt": now}));
-    }
-    // Standard 播出纠偏必须独立于 AniList：AniList 暂时不可用（例如 403）时，
-    // 仍要依据本地/缓存的 Bangumi episode 表清理未来假票并修正 next。
-    #[cfg(feature = "standard")]
-    {
-        if apply_bangumi_episode_authority(context, now).await {
-            context.save_state().map_err(|error| error.to_string())?;
-            emit_state(app, context);
-            context.webdav_wakeup.notify_one();
-        }
-    }
-    let mut schedules = Vec::new();
-    #[cfg(feature = "standard")]
-    let mut anilist_warning: Option<String> = None;
-    for page in 1..=10 {
-        let response = match anilist_request(
-            &context,
-            AIRING_QUERY,
-            json!({"ids": ids, "from": from.min(now - 60), "to": now + 1, "page": page}),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // Original 完全依赖 AniList，仍将错误如实交给调用方；Standard
-                // 则已先跑过 Bangumi 逐集纠偏，AniList 暂停（2026-09 的 403）
-                // 不能阻断安全降级和本地/坚果云自愈。
-                #[cfg(feature = "standard")]
-                {
-                    let warning = format!("AniList 分钟级播出数据暂不可用：{error}");
-                    warn!("{warning}");
-                    anilist_warning = Some(warning);
-                    break;
-                }
-                #[cfg(not(feature = "standard"))]
-                return Err(error.to_string());
-            }
-        };
-        schedules.extend(
-            response["Page"]["airingSchedules"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-        if !value_bool(response["Page"]["pageInfo"].get("hasNextPage")) {
-            break;
-        }
-    }
-    // Standard 的 Bangumi 追番不再接入 bangumi-data begin/broadcast 生成的
-    // 周播调度。它只能描述首播锚点，遇到停播/改档会把集数整体提前；逐集
-    // /v0/episodes 已在本函数开始和结束时承担真正的任务/next 裁决。
-    // 块作用域持锁（std MutexGuard 不能跨 await——Tauri 命令 future 必须 Send）。
-    let outcome = {
-        let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-        // 权威数据修复：同一 anilistId 被多个 following 条目认领时，本轮 AniList
-        // 调度只分配给主条目（anilistIndex 指向者优先，否则 followedAt 最早者），
-        // 其余条目跳过调度与 nextAiringEpisode 写回，避免同集任务在两个条目下
-        // 重复生成。AIRING_QUERY 返回的 media.nextAiringEpisode 每轮随调度写回
-        // 主条目（治愈被离线锚点污染的存量值；离线调度已跳过 anilistId 条目，
-        // 不会再在其后覆写）。
-        #[cfg(feature = "standard")]
-        let mut secondary_claimants =
-            secondary_anilist_claimant_ids(&state, &context.offline_bangumi);
-        #[cfg(feature = "standard")]
-        if let Some(items) = state["following"].as_array() {
-            // Standard Bangumi entries are reconciled by their subject episode
-            // table.  Do not let the shared AniList schedule transiently create
-            // global-numbered tasks before that reconciliation runs.
-            secondary_claimants.extend(items.iter().filter_map(|item| {
-                (value_string(item.get("source")) == "bangumi")
-                    .then(|| value_i64(item.get("id")))
-                    .filter(|id| *id > 0)
-            }));
-        }
-        #[cfg(not(feature = "standard"))]
-        let secondary_claimants = HashSet::new();
-        apply_airing_schedules_inner(&mut state, &schedules, now, &secondary_claimants)
+        apply_anilist_snapshots(&mut state, &batch, context.original, now)
     };
-    // Bangumi 确认 episode 身份；已验证 AniList 缓存可补齐分钟与改档后的
-    // 日期。最终再跑一次是为把本轮成功的 AniList 精确响应套回逐集表。
+    // Even with no AniList mapping or a failed supplement, Bangumi episodes
+    // remain the source of truth for each subject's identity and date.
     #[cfg(feature = "standard")]
-    if apply_bangumi_episode_authority(context, now).await {
-        context.save_state().map_err(|error| error.to_string())?;
-        emit_state(app, context);
-        context.webdav_wakeup.notify_one();
-    }
-    // 权威数据修复（缺口 1/2 网络自愈）：AIRING_QUERY 只返回窗口内播出的集，
-    // 窗口内零播出时无 media → next 污染无法纠正、过去时间假任务无法识别。
-    // 这里在窗口调度应用之后，按 anilistId 全量抓取 AniList 权威 next + 已播
-    // schedule：无条件重写 nextAiringEpisode、纠偏已播集 airingAt、删除未播
-    // 假票、为追踪中条目回填缺失的已播集任务（第 6 轮误删事故修复：被污染
-    // next 误删的已播任务 id 已在 seenAiringEvents、AIRING_QUERY 永不重建，
-    // 权威 schedule 是唯一可信修复源）。顺序刻意为先 apply_airing_schedules
-    // （处理已播窗口）后权威纠偏；删除规则以 next.episode 为界，本窗口刚建
-    // 的已播任务 episode < next.episode 不会被误删。
-    #[cfg(feature = "standard")]
-    let authority_changed = anilist_authority_refresh(
-        &context.state,
-        &context.offline_bangumi,
-        ANILIST_API,
-        &context.client,
-        &ids,
-        &bangumi_cache_dir(context),
-        now,
-    )
-    .await;
-    // 最终逐集应用仅接受同一 AniList 条目、同一集号的可信精确时间；不允许
-    // 分季或错误映射覆盖 Bangumi episode 身份。
-    #[cfg(feature = "standard")]
-    if apply_bangumi_episode_authority(context, now).await {
-        context.save_state().map_err(|error| error.to_string())?;
-        emit_state(app, context);
-        context.webdav_wakeup.notify_one();
-    }
+    let authority_changed = apply_bangumi_episode_authority(context, now, force, only.as_ref()).await;
     #[cfg(not(feature = "standard"))]
     let authority_changed = false;
     let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+    #[cfg(feature = "standard")]
+    {
+        heal_following_progress(&mut state);
+        outcome.aired += claim_bangumi_cached_notifications(&mut state, &bangumi_cache_dir(context), now);
+    }
+    outcome.created = state["tasks"].as_array().into_iter().flatten()
+        .filter(|task| watch_history::is_pending(task, now) && !known.contains(&value_string(task.get("id")))).count();
     state["lastSyncAt"] = json!(now);
     state["tasks"]
         .as_array_mut()
@@ -5680,13 +5621,78 @@ async fn sync_now_inner(app: &AppHandle, context: &AppContext) -> Result<Value, 
             show_desktop_notification(app, title, body);
         }
     }
-    #[cfg_attr(not(feature = "standard"), expect(unused_mut))]
     let mut result = json!({"created": outcome.created, "syncedAt": now});
-    #[cfg(feature = "standard")]
-    if let Some(warning) = anilist_warning {
-        result["warning"] = json!(warning);
+    if !batch.warnings.is_empty() {
+        result["warning"] = json!(batch.warnings.join("; "));
+        if context.original && batch.snapshots.is_empty() {
+            return Err(batch.warnings.join("; "));
+        }
     }
     Ok(result)
+}
+
+#[cfg(not(target_os = "android"))]
+fn apply_anilist_snapshots(
+    state: &mut Value, batch: &anilist_cache::Batch, original: bool, now: i64,
+) -> AiringOutcome {
+    let skipped: HashSet<i64> = state["following"].as_array().into_iter().flatten()
+        .filter(|entry| !original && (entry["source"] == "bangumi"
+            || !matches!(entry["bangumiStatus"].as_str().unwrap_or(""), "" | "doing")))
+        .map(|entry| value_i64(entry.get("id"))).collect();
+    let mut events = Vec::new();
+    for (&id, snapshot) in &batch.snapshots {
+        if !snapshot.precise(now) { continue; }
+        let mut media = snapshot.media.clone();
+        media["nextAiringEpisode"] = anilist_cache::next_episode(&snapshot.media, now);
+        for entry in state["following"].as_array_mut().into_iter().flatten() {
+            if (original || entry["source"] != "bangumi") && anilist_cache::media_id(entry, original) == Some(id) {
+                entry["nextAiringEpisode"] = media["nextAiringEpisode"].clone();
+            }
+        }
+        for node in snapshot.media["airingSchedule"]["nodes"].as_array().into_iter().flatten()
+            .chain(snapshot.media["futureAiringSchedule"]["nodes"].as_array().into_iter().flatten())
+            .chain(snapshot.media.get("nextAiringEpisode"))
+        {
+            events.push(json!({
+                "mediaId": id, "episode": node["episode"], "airingAt": node["airingAt"],
+                "media": media
+            }));
+        }
+    }
+    apply_airing_schedules_inner(state, &events, now, &skipped)
+}
+
+#[cfg(all(feature = "standard", not(target_os = "android")))]
+fn claim_bangumi_cached_notifications(state: &mut Value, directory: &Path, now: i64) -> usize {
+    let mut events = Vec::new();
+    for entry in state["following"].as_array().into_iter().flatten() {
+        if entry["source"] != "bangumi" || bangumi_status_blocks_tracking(&value_string(entry.get("bangumiStatus"))) { continue; }
+        let subject = value_i64(entry.get("id"));
+        let Some(records) = bangumi_episode_records_from_cache(directory, subject, now, i64::MAX) else { continue };
+        let precision = anilist_precise_airing_from_cache(directory, value_i64(entry.get("anilistId")), now);
+        for (episode, episode_id, at, aired) in bangumi_episode_schedule_with_precision(&records, now, &precision) {
+            if aired && at >= (now - 86400).max(value_i64(entry.get("followedAt")))
+                && episode > value_i64(entry.get("watchedEpisode"))
+                && resolved_airing_is_precise(&records, episode_id, at, Some(&precision))
+                && !state["tasks"].as_array().into_iter().flatten().any(|task| {
+                    task["status"] == "completed" && value_i64(task.get("animeId")) == subject
+                        && value_i64(task.get("episode")) == episode
+                })
+            {
+                events.push(format!("{subject}-{episode}"));
+            }
+        }
+    }
+    let mut seen: HashSet<String> = state["seenAiringEvents"].as_array().into_iter().flatten()
+        .filter_map(Value::as_str).map(str::to_string).collect();
+    let mut count = 0;
+    for event in events {
+        if seen.insert(event.clone()) {
+            state["seenAiringEvents"].as_array_mut().unwrap().push(json!(event));
+            count += 1;
+        }
+    }
+    count
 }
 
 #[tauri::command]
@@ -6556,13 +6562,10 @@ mod bangumi_commands {
 // 每条 following 记录维护 lastPulledPayloadHash / lastPushedPayloadHash
 //（对 collection 关心字段 {type,rate,ep_status,comment,tags,private} 规范化
 // JSON 的 sha256，见 bangumi::collection_payload_hash_parts）与 lastChangedBy。
-// 拉取时判定：
-// - H_remote == lastPulledPayloadHash → 远端无变化，跳过；
-// - H_local == H_remote → 方向不明，按 conflictPolicy（latest=不动+记冲突 /
-//   local-first=推远端 / bangumi-first=改本地）；若 lastPushedPayloadHash ==
-//   H_local（本地自上次推送无变更）则视为已收敛，仅更新拉取基线；
-// - 否则 → 外部变化 → 合并（写 lastPulledPayloadHash=H_remote、
-//   lastChangedBy="bangumi"）。
+// Unchanged remote content cannot undo local edits. Equal owned values are
+// convergence, not a conflict. For differing values, protect unacknowledged
+// local edits under latest/local-first; Bangumi has no reliable edit timestamp.
+// All writes stay in the push phase and respect its switches.
 // 防循环：lastChangedBy=="bangumi" 的记录不自动推送；远端驱动的取消追番即时
 // 清出 pendingBangumiUnfollows；写回仅处理 lastChangedBy 为 local/webdav 且
 // H_local != lastPushedPayloadHash 的记录。
@@ -6608,6 +6611,12 @@ mod bangumi_sync {
             .and_then(|rate| u8::try_from(rate).ok())
     }
 
+    fn collection_rating(entry: &Value) -> Option<u8> {
+        local_rating(entry).or_else(|| {
+            (value_i64(entry.get("localRatingUpdatedAt")) > 0).then_some(0)
+        })
+    }
+
     /// 本地观看进度（>=0；null → None）。
     fn local_watched_episode(entry: &Value) -> Option<u32> {
         entry
@@ -6629,7 +6638,7 @@ mod bangumi_sync {
     pub(super) fn local_collection_payload(entry: &Value) -> Value {
         let mut payload = serde_json::Map::new();
         payload.insert("type".into(), json!(local_collection_type(entry)));
-        if let Some(rate) = local_rating(entry) {
+        if let Some(rate) = collection_rating(entry) {
             payload.insert("rate".into(), json!(rate));
         }
         Value::Object(payload)
@@ -6639,12 +6648,30 @@ mod bangumi_sync {
     pub(super) fn local_collection_hash(entry: &Value) -> String {
         bangumi::collection_payload_hash_parts(
             local_collection_type(entry),
-            local_rating(entry),
+            collection_rating(entry),
             local_watched_episode(entry),
             None,
             &[],
             None,
         )
+    }
+
+    fn has_local_collection_change(entry: &Value) -> bool {
+        matches!(value_string(entry.get("lastChangedBy")).as_str(), "local" | "webdav")
+            && entry.get("lastPushedPayloadHash").and_then(Value::as_str)
+                != Some(local_collection_hash(entry).as_str())
+    }
+
+    fn collection_matches_local(entry: &Value, collection: &BangumiCollection) -> bool {
+        local_collection_type(entry) == collection.collection_type
+            && collection_rating(entry).is_none_or(|rating| Some(rating) == collection.rate)
+            && local_watched_episode(entry).is_none_or(|progress| Some(progress) == collection.ep_status)
+    }
+
+    fn same_collection_revision(current: &Value, snapshot: &Value) -> bool {
+        current.get("syncUpdatedAt") == snapshot.get("syncUpdatedAt")
+            && current.get("lastChangedBy") == snapshot.get("lastChangedBy")
+            && local_collection_hash(current) == local_collection_hash(snapshot)
     }
 
     fn find_entry_index(state: &Value, subject_id: i64) -> Option<usize> {
@@ -6656,13 +6683,18 @@ mod bangumi_sync {
         })
     }
 
-    /// 进度推送候选任务（验收第 4 轮问题 2 抽取）：completed、非拉取来源
-    /// （lastChangedBy != bangumi，防循环）、未推送过（无 lastPushedToBangumiAt）。
+    /// Only explicit user changes are upload intents. A legacy completed
+    /// snapshot without provenance must not become a new account write.
     fn push_candidate_task(task: &Value) -> bool {
         (value_string(task.get("status")) == "completed"
             || (value_string(task.get("status")) == "pending"
                 && value_string(task.get("lastChangedBy")) == "local"))
+            && (task["lastChangedBy"] == "local" || task["statusSource"] == "local")
             && task.get("lastChangedBy").and_then(Value::as_str) != Some("bangumi")
+            && !super::watch_history::needs_review(task)
+            && !(task["status"] == "completed"
+                && task["completionReview"]["decision"] != "keep"
+                && super::watch_history::is_future(task, now_seconds()))
             && !task
                 .get("lastPushedToBangumiAt")
                 .is_some_and(Value::is_number)
@@ -6738,17 +6770,11 @@ mod bangumi_sync {
         }
         report.pulled = collections.len() as u32;
 
-        // 第 1 步（无网络）：快照分类 → 创建 / 合并 / 冲突推送 / 收敛。
+        // Classify the snapshot without writing to the remote account.
         struct CreatePlan {
             collection: BangumiCollection,
             h_remote: String,
             subject: Option<BangumiSubject>,
-        }
-        struct ConflictPushPlan {
-            subject_id: i64,
-            payload: Value,
-            create: bool,
-            h_local: String,
         }
         let (following_snapshot, deleted_snapshot, task_snapshot) = {
             let guard = state.lock().expect("state lock");
@@ -6762,9 +6788,7 @@ mod bangumi_sync {
             value_i64(deleted_snapshot.get(&subject_id.to_string())) > 0
         };
         let mut creates: Vec<CreatePlan> = Vec::new();
-        let mut merges: Vec<(BangumiCollection, String)> = Vec::new();
-        let mut converged: Vec<(i64, String)> = Vec::new();
-        let mut conflict_pushes: Vec<ConflictPushPlan> = Vec::new();
+        let mut merges: Vec<(BangumiCollection, String, Value, bool)> = Vec::new();
         for collection in &collections {
             let subject_id = collection.subject_id;
             if subject_id <= 0 {
@@ -6785,17 +6809,11 @@ mod bangumi_sync {
                             subject: None,
                         });
                     }
-                    // wish/on_hold 仅建议。doing 即使存在旧墓碑也必须恢复：
-                    // 墓碑代表过去的本地取消，不应覆盖当前 Bangumi 的在看状态。
+                    // A remote snapshot is not an explicit local re-follow.
                     1 | 4 => report.suggestions.push(bangumi::BangumiSyncSuggestion {
                         subject_id,
                         name_cn: collection.subject.as_ref().and_then(|s| s.name_cn.clone()),
                         collection_type: collection.collection_type,
-                    }),
-                    3 => creates.push(CreatePlan {
-                        collection: collection.clone(),
-                        h_remote: h_remote.clone(),
-                        subject: None,
                     }),
                     // dropped（弃番）/ done（看过）且本地无条目：跳过（看过≠追番）。
                     _ => {}
@@ -6814,38 +6832,21 @@ mod bangumi_sync {
             {
                 continue;
             }
-            let h_local = local_collection_hash(entry);
-            if h_local == h_remote {
-                // H_local==H_remote：方向不明。
-                if entry.get("lastPushedPayloadHash").and_then(Value::as_str)
-                    == Some(h_local.as_str())
-                {
-                    // 本地自上次推送无变更 → 已收敛，仅更新拉取基线。
-                    converged.push((subject_id, h_remote.clone()));
-                } else {
-                    match settings.conflict_policy {
-                        // latest：不动本地，仅记录冲突。
-                        bangumi::ConflictPolicy::Latest => report.conflicts += 1,
-                        // local-first：推远端。
-                        bangumi::ConflictPolicy::LocalFirst => {
-                            conflict_pushes.push(ConflictPushPlan {
-                                subject_id,
-                                payload: local_collection_payload(entry),
-                                // H_local==H_remote 意味着远端已有等值记录 → PATCH。
-                                create: false,
-                                h_local: h_local.clone(),
-                            });
-                        }
-                        // bangumi-first：改本地（走外部变化合并）。
-                        bangumi::ConflictPolicy::BangumiFirst => {
-                            merges.push((collection.clone(), h_remote.clone()));
-                        }
-                    }
-                }
+            if collection_matches_local(entry, collection) && !has_local_progress {
+                merges.push((collection.clone(), h_remote.clone(), entry.clone(), true));
                 continue;
             }
-            // 外部变化 → 合并。
-            merges.push((collection.clone(), h_remote.clone()));
+            if has_local_collection_change(entry) {
+                match settings.conflict_policy {
+                    bangumi::ConflictPolicy::Latest => {
+                        report.conflicts += 1;
+                        continue;
+                    }
+                    bangumi::ConflictPolicy::LocalFirst => continue,
+                    bangumi::ConflictPolicy::BangumiFirst => {}
+                }
+            }
+            merges.push((collection.clone(), h_remote.clone(), entry.clone(), false));
         }
 
         // 第 2 步（网络）：为缺少内嵌 SlimSubject 的创建计划补拉条目详情。
@@ -6869,8 +6870,10 @@ mod bangumi_sync {
                 if plan.collection.subject.is_none() && plan.subject.is_none() {
                     continue; // 详情补拉失败且无内嵌概要：无法构造条目
                 }
-                if find_entry_index(&guard, plan.collection.subject_id).is_some() {
-                    continue; // 复核：应用前条目已被创建
+                if find_entry_index(&guard, plan.collection.subject_id).is_some()
+                    || super::following_tombstone_exists(&guard, plan.collection.subject_id)
+                {
+                    continue;
                 }
                 let anime =
                     collection_subject_anime(&plan.collection, plan.subject.as_ref(), offline_map);
@@ -6893,11 +6896,6 @@ mod bangumi_sync {
                 entry["lastPushedPayloadHash"] = Value::Null;
                 entry["lastChangedBy"] = json!("bangumi");
                 entry["lastPulledFromBangumiAt"] = json!(now_seconds());
-                if plan.collection.collection_type == bangumi::SubjectCollectionType::Doing.as_u32() {
-                    if let Some(tombstones) = guard["syncMetadata"]["followingDeletedAt"].as_object_mut() {
-                        tombstones.remove(&plan.collection.subject_id.to_string());
-                    }
-                }
                 guard["following"]
                     .as_array_mut()
                     .expect("following array")
@@ -6905,42 +6903,18 @@ mod bangumi_sync {
                 mark_following_changed(&mut guard, plan.collection.subject_id);
                 report.followed += 1;
             }
-            for (collection, h_remote) in &merges {
+            for (collection, h_remote, snapshot, converged) in &merges {
                 if let Some(index) = find_entry_index(&guard, collection.subject_id) {
+                    if !same_collection_revision(&guard["following"][index], snapshot) {
+                        continue;
+                    }
                     apply_remote_merge(&mut guard, index, collection, h_remote, &mut report);
-                }
-            }
-            for (subject_id, hash) in &converged {
-                if let Some(index) = find_entry_index(&guard, *subject_id) {
-                    guard["following"][index]["lastPulledPayloadHash"] = json!(hash);
-                }
-            }
-        }
-
-        // 第 4 步（网络）：conflictPolicy=local-first 的方向不明冲突推远端。
-        let mut pushed_hashes: Vec<(i64, String)> = Vec::new();
-        for push in conflict_pushes {
-            match http
-                .update_collection(&token, push.subject_id, &push.payload, push.create)
-                .await
-            {
-                Ok(()) => {
-                    report.pushed += 1;
-                    pushed_hashes.push((push.subject_id, push.h_local));
-                }
-                Err(error) => report
-                    .errors
-                    .push(super::bangumi_commands::request_error_message(error)),
-            }
-        }
-
-        // 第 5 步（锁内）：记录推送基线。
-        if !pushed_hashes.is_empty() {
-            let mut guard = state.lock().expect("state lock");
-            for (subject_id, hash) in pushed_hashes {
-                if let Some(index) = find_entry_index(&guard, subject_id) {
-                    guard["following"][index]["lastPushedPayloadHash"] = json!(hash);
-                    guard["following"][index]["lastPushedToBangumiAt"] = json!(now_seconds());
+                    if *converged {
+                        if let Some(index) = find_entry_index(&guard, collection.subject_id) {
+                            let hash = local_collection_hash(&guard["following"][index]);
+                            guard["following"][index]["lastPushedPayloadHash"] = json!(hash);
+                        }
+                    }
                 }
             }
         }
@@ -6973,12 +6947,7 @@ mod bangumi_sync {
                 let last_remote_at = value_i64(
                     state["following"][entry_index].get("lastPulledFromBangumiAt"),
                 );
-                intent_at > 0
-                    && (intent_at / 1_000 > last_remote_at
-                        || intent_at > value_i64(
-                            state["syncMetadata"]["followingDeletedAt"]
-                                .get(&entry_id.to_string()),
-                        ))
+                intent_at > last_remote_at.saturating_mul(1_000)
             };
             if local_intent {
                 return;
@@ -6998,6 +6967,7 @@ mod bangumi_sync {
                         && value_string(task.get("status")) == "pending"
                         && value_i64(task.get("episode")) > 0
                         && value_i64(task.get("episode")) <= ep_status
+                        && !push_candidate_task(task)
                     {
                         task["status"] = json!("completed");
                         task["statusSource"] = json!("bangumi");
@@ -7335,6 +7305,7 @@ mod bangumi_sync {
             payload: Value,
             create: bool,
             hash: String,
+            snapshot: Value,
         }
         let (follows, unfollows, refollowed, episode_batches) = {
             let guard = state.lock().expect("state lock");
@@ -7388,12 +7359,13 @@ mod bangumi_sync {
                         payload: local_collection_payload(entry),
                         create,
                         hash,
+                        snapshot: entry.clone(),
                     });
                 }
             }
-            let mut episode_batches: Vec<((i64, bool), Vec<i64>)> = Vec::new();
+            let mut episode_batches: Vec<((i64, bool), Vec<Value>)> = Vec::new();
             if settings.push_completed_episodes {
-                let mut grouped: BTreeMap<(i64, bool), Vec<i64>> = BTreeMap::new();
+                let mut grouped: BTreeMap<(i64, bool), Vec<Value>> = BTreeMap::new();
                 for task in guard["tasks"].as_array().into_iter().flatten() {
                     if !push_candidate_task(task) {
                         continue;
@@ -7406,11 +7378,11 @@ mod bangumi_sync {
                         .get("episodeId")
                         .and_then(Value::as_i64)
                         .filter(|value| *value > 0);
-                    let (Some(subject_id), Some(episode_id)) = (subject_id, episode_id) else {
+                    let (Some(subject_id), Some(_episode_id)) = (subject_id, episode_id) else {
                         continue;
                     };
                     grouped.entry((subject_id, value_string(task.get("status")) == "completed"))
-                        .or_default().push(episode_id);
+                        .or_default().push(task.clone());
                 }
                 episode_batches = grouped.into_iter().collect();
             }
@@ -7420,6 +7392,9 @@ mod bangumi_sync {
         // 第 2 步（网络）：写回请求（官方 `-` 占位当前 token 用户）。
         let mut done_unfollows: Vec<i64> = Vec::new();
         for subject_id in unfollows {
+            if find_entry_index(&state.lock().expect("state lock"), subject_id).is_some() {
+                continue;
+            }
             let dropped = json!({"type": bangumi::SubjectCollectionType::Dropped.as_u32()});
             let result = match http
                 .update_collection(&token, subject_id, &dropped, false)
@@ -7472,6 +7447,15 @@ mod bangumi_sync {
                     }
                 }
             }
+            let still_current = {
+                let guard = state.lock().expect("state lock");
+                find_entry_index(&guard, push.subject_id).is_some_and(|index| {
+                    same_collection_revision(&guard["following"][index], &push.snapshot)
+                })
+            };
+            if !still_current {
+                continue;
+            }
             match http
                 .update_collection(&token, push.subject_id, &push.payload, create)
                 .await
@@ -7485,8 +7469,21 @@ mod bangumi_sync {
                     .push(super::bangumi_commands::request_error_message(error)),
             }
         }
-        let mut done_batches: Vec<((i64, bool), Vec<i64>)> = Vec::new();
-        for ((subject_id, completed), episode_ids) in episode_batches {
+        let mut done_batches: Vec<Vec<Value>> = Vec::new();
+        for ((subject_id, completed), snapshots) in episode_batches {
+            let current: Vec<Value> = {
+                let guard = state.lock().expect("state lock");
+                snapshots.into_iter().filter(|snapshot| guard["tasks"].as_array().into_iter().flatten()
+                    .any(|task| task.get("id") == snapshot.get("id")
+                        && task.get("syncUpdatedAt") == snapshot.get("syncUpdatedAt")
+                        && task.get("status") == snapshot.get("status")
+                        && task.get("episodeId") == snapshot.get("episodeId")
+                        && push_candidate_task(task))).collect()
+            };
+            let mut episode_ids: Vec<i64> = current.iter().map(|task| value_i64(task.get("episodeId"))).collect();
+            episode_ids.sort_unstable();
+            episode_ids.dedup();
+            if episode_ids.is_empty() { continue; }
             match http
                 .update_episode_progress_batch(
                     &token,
@@ -7497,7 +7494,7 @@ mod bangumi_sync {
                 .await
             {
                 Ok(()) => {
-                    done_batches.push(((subject_id, completed), episode_ids));
+                    done_batches.push(current);
                     report.pushed += 1;
                 }
                 Err(error) => report
@@ -7513,7 +7510,9 @@ mod bangumi_sync {
                 super::remove_pending_bangumi_unfollow(&mut guard, subject_id);
             }
             for subject_id in refollowed {
-                super::remove_pending_bangumi_unfollow(&mut guard, subject_id);
+                if find_entry_index(&guard, subject_id).is_some() {
+                    super::remove_pending_bangumi_unfollow(&mut guard, subject_id);
+                }
             }
             for (subject_id, hash) in done_follows {
                 if let Some(index) = find_entry_index(&guard, subject_id) {
@@ -7521,15 +7520,14 @@ mod bangumi_sync {
                     guard["following"][index]["lastPushedToBangumiAt"] = json!(now_seconds());
                 }
             }
-            for ((subject_id, completed), episode_ids) in done_batches {
+            for snapshots in done_batches {
                 if let Some(tasks) = guard["tasks"].as_array_mut() {
                     for task in tasks.iter_mut() {
-                        if value_i64(task.get("subjectId")) == subject_id
-                            && (value_string(task.get("status")) == "completed") == completed
-                            && task
-                                .get("episodeId")
-                                .and_then(Value::as_i64)
-                                .is_some_and(|episode_id| episode_ids.contains(&episode_id))
+                        if snapshots.iter().any(|snapshot|
+                            task.get("id") == snapshot.get("id")
+                                && task.get("status") == snapshot.get("status")
+                                && task.get("episodeId") == snapshot.get("episodeId")
+                                && task.get("syncUpdatedAt") == snapshot.get("syncUpdatedAt"))
                         {
                             task["lastPushedToBangumiAt"] = json!(now_seconds());
                             task["syncUpdatedAt"] = json!(now_millis());
@@ -7615,6 +7613,11 @@ fn bangumi_sync_scope(sync_enabled: bool, has_token: bool) -> BangumiSyncScope {
 /// Token/Authorization），截断 300 字符。
 #[cfg(feature = "standard")]
 async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<Value, String> {
+    run_full_bangumi_sync_with_policy(app, context, false).await
+}
+
+#[cfg(feature = "standard")]
+async fn run_full_bangumi_sync_with_policy(app: &AppHandle, context: &AppContext, force: bool) -> Result<Value, String> {
     let sync_enabled = {
         let state = context.state.lock().map_err(|_| "状态锁不可用")?;
         bangumi_sync::sync_settings(&state).sync_enabled
@@ -7638,11 +7641,10 @@ async fn run_full_bangumi_sync(app: &AppHandle, context: &AppContext) -> Result<
     //    语义，经 async 块延迟到步骤 2 位置执行）；桌面复用 sync_now_inner。
     #[cfg(target_os = "android")]
     let schedule = async move {
-        let _ = mobile::sync_native(app, context);
-        Ok::<Value, String>(json!({}))
+        mobile::sync_native_with_policy(app, context, force, 0).map_err(|error| error.to_string())
     };
     #[cfg(not(target_os = "android"))]
-    let schedule = sync_now_inner(app, context);
+    let schedule = sync_schedules(app, context, force, None);
     let payload = run_full_bangumi_sync_core(context, scope, webdav, schedule).await?;
     refresh_mobile_configuration(app, context)?;
     emit_state(app, context);
@@ -7659,6 +7661,7 @@ async fn run_full_bangumi_sync_core(
     webdav: Option<impl std::future::Future<Output = anyhow::Result<Value>>>,
     schedule: impl std::future::Future<Output = Result<Value, String>>,
 ) -> Result<Value, String> {
+    let _sync_guard = context.bangumi_sync_lock.lock().await;
     let mut report = bangumi::BangumiSyncReport::default();
     let mut error_summary: Vec<String> = Vec::new();
     // 1) 坚果云同步（三字段业务数据先合流）。Phase 4：不受 Bangumi 开关/Token
@@ -7681,8 +7684,13 @@ async fn run_full_bangumi_sync_core(
     }
     // 2) 主数据轻刷新（播出调度 / 任务）——schedule future 由调用方注入
     //    （Android = mobile 桥；桌面 = sync_now_inner）。
-    if let Err(error) = schedule.await {
-        error_summary.push(format!("主数据刷新失败：{error}"));
+    let schedule_warning = match schedule.await {
+        Ok(result) => value_string(result.get("warning")),
+        Err(error) => format!("主数据刷新失败：{error}"),
+    };
+    if !schedule_warning.is_empty() {
+        error_summary.push(schedule_warning.clone());
+        report.errors.push(schedule_warning);
     }
     {
         let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
@@ -7768,14 +7776,17 @@ async fn run_full_bangumi_sync_core(
         );
     }
     context.save_state().map_err(|error| error.to_string())?;
-    let ok = report.errors.is_empty();
+    let ok = error_summary.is_empty();
     let message = match scope {
         BangumiSyncScope::Full => {
             if ok {
                 "Bangumi 同步完成".to_string()
             } else {
-                format!("同步完成，但出现 {} 条错误", report.errors.len())
+                format!("同步完成，但出现 {} 条错误", error_summary.len())
             }
+        }
+        BangumiSyncScope::LocalOnly { .. } if !ok => {
+            format!("同步完成，但出现 {} 条错误", error_summary.len())
         }
         BangumiSyncScope::LocalOnly { reason } => {
             if webdav_ran {
@@ -8077,7 +8088,7 @@ async fn bangumi_sync_now(app: AppHandle, context: State<'_, AppContext>) -> Res
     }
     #[cfg(feature = "standard")]
     {
-        return run_full_bangumi_sync(&app, &context).await;
+        return run_full_bangumi_sync_with_policy(&app, &context, true).await;
     }
     #[cfg(not(feature = "standard"))]
     {
@@ -8267,6 +8278,7 @@ async fn bangumi_set_collection_status(
     }
     #[cfg(feature = "standard")]
     {
+        let _sync_guard = context.bangumi_sync_lock.lock().await;
         const VALID_STATUSES: [&str; 5] = ["wish", "doing", "done", "on_hold", "dropped"];
         if !VALID_STATUSES.contains(&status.as_str()) {
             return Ok(json!({
@@ -8276,9 +8288,10 @@ async fn bangumi_set_collection_status(
             }));
         }
         let dropped = status == "dropped";
-        let (has_token, base, write_payload) = {
+        let (has_token, base, write_payload, write_hash) = {
             let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
             if !apply_bangumi_collection_status(&mut state, subject_id, &status) {
+                drop(state);
                 return Ok(json!({
                     "ok": false,
                     "message": "未找到对应追番条目",
@@ -8304,9 +8317,18 @@ async fn bangumi_set_collection_status(
                         .map(bangumi_sync::local_collection_payload)
                 })
             };
+            let write_hash = state["following"].as_array().and_then(|items| {
+                items.iter().find(|item| {
+                    value_i64(item.get("id")) == subject_id
+                        || value_i64(item.get("bangumiId")) == subject_id
+                }).map(bangumi_sync::local_collection_hash)
+            });
             let base = bangumi_base_urls(&state);
-            (has_token, base, write_payload)
+            (has_token, base, write_payload, write_hash)
         };
+        context.save_state().map_err(|error| error.to_string())?;
+        refresh_mobile_configuration(&app, &context)?;
+        emit_state(&app, &context);
         let mut message = String::new();
         if has_token {
             if let (Some(token), Some(payload)) =
@@ -8340,9 +8362,8 @@ async fn bangumi_set_collection_status(
                                 })
                             })
                         {
-                            let hash =
-                                bangumi_sync::local_collection_hash(&state["following"][index]);
-                            state["following"][index]["lastPushedPayloadHash"] = json!(hash);
+                            // A later rating edit was not part of this request.
+                            state["following"][index]["lastPushedPayloadHash"] = json!(write_hash);
                             state["following"][index]["lastPushedToBangumiAt"] =
                                 json!(now_seconds());
                         }
@@ -8379,6 +8400,24 @@ async fn bangumi_set_collection_status(
     }
 }
 
+#[cfg(feature = "standard")]
+fn apply_bangumi_rating(state: &mut Value, subject_id: i64, rating: Option<u8>) -> bool {
+    let Some(entry) = state["following"].as_array_mut().and_then(|items| {
+        items.iter_mut().find(|item| {
+            value_i64(item.get("id")) == subject_id
+                || value_i64(item.get("bangumiId")) == subject_id
+        })
+    }) else {
+        return false;
+    };
+    let id = value_i64(entry.get("id"));
+    entry["rating"] = rating.map(|value| json!(value)).unwrap_or(Value::Null);
+    entry["localRatingUpdatedAt"] = json!(now_millis());
+    entry["lastChangedBy"] = json!("local");
+    mark_following_changed(state, id);
+    true
+}
+
 /// Phase 3：`bangumi_set_rating({ subjectId, rating })`。本地评分写入 following
 /// 条目并标记 lastChangedBy=local（H_local 随之变化，push_local_changes 幂等
 /// 判定后写回 PATCH rate；rating=null 表示清除评分）。
@@ -8398,26 +8437,16 @@ fn bangumi_set_rating(
             return Ok(json!({"ok": false, "message": "评分需在 0-10 之间"}));
         }
         let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
-        let index = state["following"].as_array().and_then(|items| {
-            items.iter().position(|item| {
-                value_i64(item.get("id")) == subject_id
-                    || value_i64(item.get("bangumiId")) == subject_id
-            })
-        });
-        let Some(index) = index else {
+        if !apply_bangumi_rating(&mut state, subject_id, rating) {
             return Ok(json!({"ok": false, "message": "未找到对应追番条目"}));
-        };
-        let anime_id = value_i64(state["following"][index].get("id"));
-        state["following"][index]["rating"] =
-            rating.map(|value| json!(value)).unwrap_or(Value::Null);
-        state["following"][index]["lastChangedBy"] = json!("local");
-        mark_following_changed(&mut state, anime_id);
+        }
         drop(state);
         context.save_state().map_err(|error| error.to_string())?;
         context.webdav_wakeup.notify_one();
         // 问题 2b：评分是本地变更（上方已置 lastChangedBy=local，核对无误）
         // → 唤醒桌面自动同步（写回 PATCH rate）。
         notify_bangumi_sync_wakeup(true);
+        refresh_mobile_configuration(&app, &context)?;
         emit_state(&app, &context);
         return Ok(json!({"ok": true, "message": "评分已保存，将在同步时写回 Bangumi"}));
     }
@@ -9647,7 +9676,7 @@ fn claim_daily_task_reminder(
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|task| value_string(task.get("status")) == "pending")
+        .filter(|task| watch_history::is_pending(task, now_seconds()))
         .count();
     if pending == 0 {
         return None;
@@ -9721,13 +9750,13 @@ pub fn run() {
     builder
         .setup(move |app| {
             let context = load_context(app.handle(), original)?;
-            app.manage(context.clone());
             #[cfg(target_os = "android")]
             {
                 mobile::import_legacy_state(app.handle(), &context)?;
                 mobile::consume_events(app.handle(), &context)?;
                 mobile::configure(app.handle(), &context)?;
             }
+            app.manage(context.clone());
             // Phase 4 任务 1：Android 前台过期同步补偿（setup 完成后异步执行，
             // 仅 standard edition；Windows 桌面启动路径零变化）。
             #[cfg(all(feature = "standard", target_os = "android"))]
@@ -9781,6 +9810,7 @@ pub fn run() {
             get_state,
             fetch_season,
             toggle_follow,
+            unfollow,
             update_follow_title,
             resolve_bangumi_title,
             test_bangumi_connection,
@@ -9800,6 +9830,7 @@ pub fn run() {
             bangumi_set_rating,
             bangumi_set_collection_status,
             toggle_task,
+            resolve_task_review,
             update_settings,
             sync_now,
             get_cache_info,
@@ -10283,7 +10314,7 @@ mod tests {
         );
         assert_eq!(
             season_cache_ttl_millis("SUMMER", 2026, 2026, 7),
-            6 * 3_600_000
+            24 * 3_600_000
         );
         assert_eq!(
             season_cache_ttl_millis("FALL", 2025, 2026, 1),
@@ -10291,7 +10322,7 @@ mod tests {
         );
         assert_eq!(
             season_cache_ttl_millis("FALL", 2027, 2026, 7),
-            6 * 3_600_000
+            24 * 3_600_000
         );
     }
 
@@ -12181,8 +12212,7 @@ mod tests {
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(22222, " wishing 甲")},
             {"subject_id": 33333, "subject_type": 2, "rate": null, "type": 4,
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(33333, "搁置 乙")},
-            // 本地无 + 墓碑：doing 当前仍是远端在看，应恢复本地追番；
-            // 墓碑只代表旧的本地取消意图。
+            // A deletion tombstone blocks reimport of a stale remote Doing.
             {"subject_id": 44444, "subject_type": 2, "rate": null, "type": 3,
              "tags": [], "ep_status": 0, "private": false, "subject": slim_subject(44444, "被删 丙")},
             // 本地无：doing → 创建 following（内嵌 SlimSubject）。
@@ -12240,7 +12270,7 @@ mod tests {
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.pulled, 7);
-        assert_eq!(report.followed, 2);
+        assert_eq!(report.followed, 1);
         assert_eq!(report.unfollowed, 1);
         assert_eq!(report.completed_tasks, 1);
         assert_eq!(report.conflicts, 0);
@@ -12313,9 +12343,8 @@ mod tests {
         assert_eq!(entry(22222).unwrap()["bangumiStatus"], "wish");
         assert!(entry(33333).is_some());
         assert_eq!(entry(33333).unwrap()["bangumiStatus"], "on_hold");
-        // 远端 doing 会恢复本地追番，即使本地残留旧墓碑。
-        let revived = entry(44444).expect("44444 revived from remote doing");
-        assert_eq!(revived["bangumiStatus"], "doing");
+        assert!(entry(44444).is_none());
+        assert!(value_i64(guard["syncMetadata"]["followingDeletedAt"].get("44444")) > 0);
         // doing 无墓碑 → 新建 following（复用 bangumi 构造 + 收藏字段）。
         let created = entry(55555).expect("55555 created");
         assert_eq!(created["source"], "bangumi");
@@ -12535,11 +12564,11 @@ mod tests {
             // → 98767），随批量 PATCH 上传。
             {"id": "45678-5", "animeId": 45678, "animeTitle": "示例", "episode": 5,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null},
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null, "lastChangedBy": "local"},
             // 已带 episodeId → 不覆盖、照常上传（98765）。
             {"id": "45678-4", "animeId": 45678, "animeTitle": "示例", "episode": 4,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98765},
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": 98765, "lastChangedBy": "local"},
             // 拉取来的完成（lastChangedBy=bangumi）→ 不绑定也不上传。
             {"id": "45678-3", "animeId": 45678, "animeTitle": "示例", "episode": 3,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
@@ -12650,7 +12679,7 @@ mod tests {
             guard["tasks"].as_array_mut().unwrap().push(json!({
                 "id": "45678-6", "animeId": 45678, "animeTitle": "示例", "episode": 4,
                 "airingAt": 10, "status": "completed", "createdAt": 30, "completedAt": 40,
-                "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null
+                "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null, "lastChangedBy": "local"
             }));
         }
         let report = rt.block_on(bangumi_sync::push_local_changes(
@@ -12698,10 +12727,10 @@ mod tests {
         state["tasks"] = json!([
             {"id": "45678-2", "animeId": 45678, "animeTitle": "示例", "episode": 2,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null},
+             "syncUpdatedAt": 1, "subjectId": 45678, "episodeId": null, "lastChangedBy": "local"},
             {"id": "55555-4", "animeId": 55555, "animeTitle": "示例", "episode": 4,
              "airingAt": 10, "status": "completed", "createdAt": 10, "completedAt": 20,
-             "syncUpdatedAt": 1, "subjectId": 55555, "episodeId": null}
+             "syncUpdatedAt": 1, "subjectId": 55555, "episodeId": null, "lastChangedBy": "local"}
         ]);
         let state = std::sync::Mutex::new(state);
         let tokens = bangumi::MemoryTokenStore::new();
@@ -14155,8 +14184,7 @@ mod tests {
     fn bangumi_conflict_policy_three_ways() {
         use crate::bangumi::test_support::MockBangumiServer;
 
-        // 远端与本地内容完全一致（H_local==H_remote），但本地与远端各自的
-        // 基线 hash 都已过期 → 方向不明，按 conflictPolicy 分派。
+        // Both sides changed different values since the stored baselines.
         let remote = json!({
             "subject_id": 45678, "subject_type": 2, "rate": 8, "type": 3,
             "tags": [], "ep_status": 3, "private": false
@@ -14195,7 +14223,7 @@ mod tests {
             state["following"] = json!([bangumi_following(
                 45678,
                 json!({
-                    "rating": 8, "watchedEpisode": 3,
+                    "rating": 10, "watchedEpisode": 3, "lastChangedBy": "local",
                     "lastPulledPayloadHash": stale_pulled,
                     "lastPushedPayloadHash": stale_pushed
                 })
@@ -14233,26 +14261,16 @@ mod tests {
             assert_eq!(entry["lastPushedPayloadHash"], json!(stale_pushed));
         }
 
-        // local-first：推远端（本地 payload PATCH）+ 记录推送基线。
+        // Local-first preserves the edit; writes belong to the gated push phase.
         let (report, server, state) = run("local-first");
         assert_eq!(report.conflicts, 0);
-        assert_eq!(report.pushed, 1);
-        let patch = server
-            .requests()
-            .into_iter()
-            .find(|request| {
-                request.method == "PATCH" && request.target == "/v0/users/-/collections/45678"
-            })
-            .expect("local-first pushes local payload");
-        let payload: Value = serde_json::from_str(&patch.body).unwrap();
-        assert_eq!(payload["type"], 3);
-        assert_eq!(payload["rate"], 8);
+        assert_eq!(report.pushed, 0);
+        assert_eq!(write_count(&server.requests()), 0);
         {
             let guard = state.lock().unwrap();
             let entry = &guard["following"][0];
-            let expected_local =
-                bangumi::collection_payload_hash_parts(3, Some(8), Some(3), None, &[], None);
-            assert_eq!(entry["lastPushedPayloadHash"], json!(expected_local));
+            assert_eq!(entry["rating"], 10);
+            assert_eq!(entry["lastPushedPayloadHash"], json!(stale_pushed));
         }
 
         // bangumi-first：改本地（合并远端），零写请求。
@@ -14559,6 +14577,8 @@ mod tests {
             sync_wakeup: Arc::new(tokio::sync::Notify::new()),
             webdav_wakeup: Arc::new(tokio::sync::Notify::new()),
             webdav_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(not(target_os = "android"))]
+            schedule_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(desktop)]
             main_window_opening: Arc::new(AtomicBool::new(false)),
             bangumi_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -14567,6 +14587,7 @@ mod tests {
             // MemoryTokenStore：无 Token → LocalOnly 作用域。
             bangumi_tokens: Arc::new(bangumi::MemoryTokenStore::new()),
             bangumi_username_cache: Arc::new(Mutex::new(None)),
+            bangumi_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let webdav_calls = Arc::new(AtomicI64::new(0));
         let schedule_calls = Arc::new(AtomicI64::new(0));
@@ -14585,7 +14606,9 @@ mod tests {
                 };
                 let schedule_future = {
                     let calls = Arc::clone(&schedule_calls);
+                    let sync_lock = Arc::clone(&context.bangumi_sync_lock);
                     async move {
+                        assert!(sync_lock.try_lock().is_err(), "the full sync owns the transaction lock");
                         calls.fetch_add(1, Ordering::AcqRel);
                         Ok::<Value, String>(json!({}))
                     }
@@ -14729,12 +14752,15 @@ mod tests {
             sync_wakeup: Arc::new(tokio::sync::Notify::new()),
             webdav_wakeup: Arc::new(tokio::sync::Notify::new()),
             webdav_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(not(target_os = "android"))]
+            schedule_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             main_window_opening: Arc::new(AtomicBool::new(false)),
             bangumi_lookup_lock: Arc::new(tokio::sync::Mutex::new(())),
             bangumi_unavailable_until: Arc::new(AtomicI64::new(0)),
             offline_bangumi: Arc::new(json!({})),
             bangumi_tokens: Arc::new(bangumi::MemoryTokenStore::new()),
             bangumi_username_cache: Arc::new(Mutex::new(None)),
+            bangumi_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let public = context.public_state();
         assert_eq!(public["bangumiSyncSettings"], public["bangumi"]);
@@ -15302,7 +15328,7 @@ mod tests {
                 (200, vec![], page.to_string())
             } else if method == "POST" {
                 // AniList GraphQL 补充覆盖请求（id_in 批量）。
-                assert!(body.contains("SeasonAniListEnrich"));
+                assert!(body.contains("AniListAuthority"));
                 assert!(body.contains("12345") && body.contains("999"));
                 let data = json!({"data": {"Page": {"pageInfo": {"lastPage": 1}, "media": [
                     {"id": 12345, "status": "RELEASING", "episodes": 13, "duration": 24,
@@ -15310,7 +15336,7 @@ mod tests {
                      "bannerImage": "https://img.anilist.co/banner.jpg",
                      "studios": {"nodes": [{"name": "Studio Bind"}]},
                      "nextAiringEpisode": {"episode": 4, "airingAt": 1_800_000_000, "timeUntilAiring": 86_400},
-                     "airingSchedule": {"nodes": [
+                     "futureAiringSchedule": {"nodes": [
                         {"episode": 1, "airingAt": 1_768_400_000},
                         {"episode": 2, "airingAt": 1_768_900_000},
                         {"episode": 3, "airingAt": 1_769_000_000}]}},
@@ -15346,6 +15372,7 @@ mod tests {
         let anilist_source = AniListSeasonSource {
             client: &client,
             endpoint: &server.url(),
+            cache_dir: directory.join("anilist-cache"),
         };
 
         let fetch = tokio::runtime::Builder::new_current_thread()
@@ -15453,6 +15480,7 @@ mod tests {
         let anilist_source = AniListSeasonSource {
             client: &client,
             endpoint: &server.url(),
+            cache_dir: directory.join("anilist-cache"),
         };
 
         let fetch = tokio::runtime::Builder::new_current_thread()

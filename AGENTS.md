@@ -5,7 +5,7 @@
 ## 当前状态
 
 - 当前正式版：`v0.7.4`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest；Android `versionCode=13`。
-- 当前维护安排：本地与 GitHub 暂时固定使用 `v0.7.4`，应用源码基线为标签 `v0.7.4`（`090593d`）。不继续 API 请求/缓存优化或下一版开发；只有维护者明确提出新任务后才开展变更。维护状态可作纯文档同步，不移动发布标签或覆盖既有附件。
+- 当前维护安排：公开正式版与 GitHub Latest 保持 `v0.7.4`。维护者已授权修复追番、同步与请求缓存；根据 rc.2 验收反馈继续修正异常完成历史计数，当前本地候选版为 `v0.7.5-rc.3`（Android `versionCode=17`，高于 rc.2 的 code 16）。不自动提交、推送或发布，不移动既有发布标签或覆盖正式附件。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。
@@ -18,6 +18,7 @@
 - 取消追番只删除对应作品的未完成任务；已完成任务必须作为观看历史保留。
 - 共用 AniList ID 的 Bangumi 分篇必须按各自 subject/episode 保留任务；日期级日程不得触发精确通知，不得仅凭 `episode >= nextEpisode` 删除已播任务。
 - Android 前后台必须传递完整任务记录及时间戳；自动补回的 `statusSource=airing` 待看任务不得覆盖已完成记录，手动撤销仍按更新时间合并。
+- 有逐集证据确认尚未播出的完成记录进入 `completionReview`，保留原始记录，但不计入已看进度或自动写回。只有用户确认核对结果才可恢复计数或撤销完成；不得自动删除历史或猜测云端进度。
 - WebDAV 只同步 `following`、`tasks`、`followingDeletedAt`，不得同步设备设置、通知开关、缓存或凭据。
 - WebDAV 凭据不得进入状态 JSON、日志、提交、Issue 或文档。Windows 密码使用 Credential Manager，Android 密码使用 Android Keystore。
 - Android 的 `createWatchTasks=false` 只关闭手机端自动创建观看任务，不得关闭播出通知。
@@ -25,6 +26,7 @@
 - Android 每次 beta、rc、正式发布都必须递增 `bundle.android.versionCode`，并使用与 v0.5.0 相同的发布证书，否则无法覆盖升级。不得提交密钥、alias、密码或本机签名路径。
 - `src-tauri/tauri.android-original.conf.json` 不是 Original 实际包名的唯一依据；`ANILOG_ANDROID_EDITION=original` 会在 Gradle 中切换为 `io.anilog.android.original`。
 - 不要为了统一数字而直接统一旧浏览器实现与 Rust 实现的 Bangumi resolver version；两条实现需分别分析。
+- AniList 请求分级与缓存契约见 [`docs/ANILIST_REQUEST_POLICY.md`](docs/ANILIST_REQUEST_POLICY.md)；缓存不进 WebDAV，跨 Android 前后台传递时保留原始获取时间。
 
 ## 修改与验证
 

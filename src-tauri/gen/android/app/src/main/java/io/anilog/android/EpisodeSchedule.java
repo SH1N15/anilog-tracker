@@ -72,6 +72,14 @@ final class EpisodeSchedule {
                 if (node != null) nodes.add(node);
             }
         }
+        JSONObject futureSchedule = media.optJSONObject("futureAiringSchedule");
+        JSONArray future = futureSchedule == null ? null : futureSchedule.optJSONArray("nodes");
+        if (future != null) {
+            for (int index = 0; index < future.length(); index++) {
+                JSONObject node = future.optJSONObject(index);
+                if (node != null) nodes.add(node);
+            }
+        }
         JSONObject next = media.optJSONObject("nextAiringEpisode");
         if (next != null) {
             nodes.removeIf(node -> node.optInt("episode") == next.optInt("episode"));
@@ -80,9 +88,42 @@ final class EpisodeSchedule {
         return nodes;
     }
 
+    private static boolean usesSubjectEpisodeNumbers(JSONArray episodes, List<JSONObject> nodes, long now) {
+        Set<Integer> confirmed = new HashSet<>();
+        for (int index = 0; index < episodes.length(); index++) {
+            JSONObject row = episodes.optJSONObject(index);
+            if (row == null || row.optInt("type", 0) != 0) continue;
+            int local = number(row);
+            int global = integer(row.optDouble("sort", Double.NaN));
+            String date = row.optString("airdate", "");
+            if (local <= 0 || global <= 0 || local == global || date.length() < 10) continue;
+            long day = timestamp(date.substring(0, 10));
+            if (day <= 0 || day / 86400L >= now / 86400L) continue;
+            int sameDay = 0;
+            for (int other = 0; other < episodes.length(); other++) {
+                JSONObject candidate = episodes.optJSONObject(other);
+                if (candidate != null && candidate.optInt("type", 0) == 0
+                    && candidate.optString("airdate", "").startsWith(date.substring(0, 10))) sameDay++;
+            }
+            if (sameDay != 1) continue;
+            Set<Integer> candidates = new HashSet<>();
+            for (JSONObject node : nodes) {
+                long at = node.optLong("airingAt");
+                if (at <= now && sameDate(date, at)) candidates.add(node.optInt("episode"));
+            }
+            if (candidates.size() == 1) {
+                if (!candidates.contains(local)) return false;
+                confirmed.add(local);
+            }
+        }
+        // Match the Rust kernel: two unique calendar anchors are required.
+        return confirmed.size() >= 2;
+    }
+
     static JSONArray resolve(JSONObject follow, JSONArray episodes, JSONObject media, long now) throws JSONException {
         List<JSONObject> rows = new ArrayList<>();
         List<JSONObject> nodes = preciseNodes(media);
+        boolean usesLocalNumbers = usesSubjectEpisodeNumbers(episodes, nodes, now);
         Set<Integer> seen = new HashSet<>();
         for (int index = 0; index < episodes.length(); index++) {
             JSONObject episode = episodes.optJSONObject(index);
@@ -97,7 +138,7 @@ final class EpisodeSchedule {
             boolean split = global > 0 && global != local;
             long matched = 0;
             for (JSONObject node : nodes) {
-                if (node.optInt("episode") == (split ? global : local)) {
+                if (node.optInt("episode") == (split && !usesLocalNumbers ? global : local)) {
                     matched = node.optLong("airingAt", 0);
                     break;
                 }
@@ -191,12 +232,24 @@ final class EpisodeSchedule {
             boolean belongs = task.optInt("subjectId") == subject || task.optInt("animeId") == subject;
             int episode = task.optInt("episode");
             if (!belongs || "completed".equals(task.optString("status"))) {
+                if (belongs) {
+                    JSONObject row = find(rows, episode);
+                    if (row != null && row.optLong("airingAt") > 0) {
+                        // Retain the old completion; verified future evidence
+                        // moves it out of counted history until user review.
+                        JSONObject evidence = new JSONObject(task.toString())
+                            .put("airingAt", row.optLong("airingAt"))
+                            .put("airingPrecision", row.optString("airingPrecision"))
+                            .put("airingSource", "bangumi_episode").put("episodeId", row.optLong("episodeId"));
+                        if (WatchHistory.reviewFutureCompletion(evidence, now)) task = evidence;
+                    }
+                }
                 kept.put(task);
                 if (belongs) known.add(episode);
                 continue;
             }
             JSONObject row = find(rows, episode);
-            if (row != null && future(row, now)) continue;
+            if (row != null && future(row, now) && !WatchHistory.isReset(task)) continue;
             if (follow.optInt("episodes") > 0 && episode > follow.optInt("episodes")) continue;
             JSONObject normalized = new JSONObject(task.toString());
             if (row != null) {

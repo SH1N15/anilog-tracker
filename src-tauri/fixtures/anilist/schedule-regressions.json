@@ -1,0 +1,60 @@
+{
+  "checkedAt": 1789345800,
+  "cases": [
+    {
+      "subjectId": 607340,
+      "anilistId": 202269,
+      "episodes": [
+        {"id": 1702093, "ep": 1, "sort": 1, "type": 0, "airdate": "2026-07-06"},
+        {"id": 1702094, "ep": 2, "sort": 2, "type": 0, "airdate": "2026-07-13"},
+        {"id": 1702102, "ep": 10, "sort": 10, "type": 0, "airdate": "2026-09-07"},
+        {"id": 1702103, "ep": 11, "sort": 11, "type": 0, "airdate": "2026-09-14"},
+        {"id": 1702104, "ep": 12, "sort": 12, "type": 0, "airdate": "2026-09-21"}
+      ],
+      "media": {
+        "id": 202269,
+        "status": "RELEASING",
+        "episodes": 12,
+        "nextAiringEpisode": {"episode": 11, "airingAt": 1789387200},
+        "airingSchedule": {"nodes": [
+          {"episode": 1, "airingAt": 1783339200},
+          {"episode": 2, "airingAt": 1783944000},
+          {"episode": 10, "airingAt": 1788782400}
+        ]},
+        "futureAiringSchedule": {"nodes": [
+          {"episode": 11, "airingAt": 1789387200},
+          {"episode": 12, "airingAt": 1789992000}
+        ]}
+      },
+      "expectedNext": {"episode": 11, "episodeId": 1702103, "airingAt": 1789387200}
+    },
+    {
+      "subjectId": 638497,
+      "anilistId": 210031,
+      "episodes": [
+        {"id": 1704756, "ep": 1, "sort": 13, "type": 0, "airdate": "2026-07-05"},
+        {"id": 1704757, "ep": 2, "sort": 14, "type": 0, "airdate": "2026-07-12"},
+        {"id": 1704765, "ep": 10, "sort": 22, "type": 0, "airdate": "2026-09-06"},
+        {"id": 1704766, "ep": 11, "sort": 23, "type": 0, "airdate": "2026-09-13"},
+        {"id": 1704767, "ep": 12, "sort": 24, "type": 0, "airdate": "2026-09-27"},
+        {"id": 1717851, "ep": 13, "sort": 25, "type": 0, "airdate": "2026-10-04"}
+      ],
+      "media": {
+        "id": 210031,
+        "status": "RELEASING",
+        "episodes": 13,
+        "nextAiringEpisode": {"episode": 12, "airingAt": 1789891200},
+        "airingSchedule": {"nodes": [
+          {"episode": 1, "airingAt": 1783238400},
+          {"episode": 2, "airingAt": 1783843200},
+          {"episode": 10, "airingAt": 1788681600},
+          {"episode": 11, "airingAt": 1789286400}
+        ]},
+        "futureAiringSchedule": {"nodes": [
+          {"episode": 12, "airingAt": 1789891200}
+        ]}
+      },
+      "expectedNext": {"episode": 12, "episodeId": 1704767, "airingAt": 1789891200}
+    }
+  ]
+}

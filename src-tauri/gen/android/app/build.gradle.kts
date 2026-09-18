@@ -57,6 +57,7 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    sourceSets.getByName("test").resources.srcDir("../../../fixtures")
 }
 
 rust {

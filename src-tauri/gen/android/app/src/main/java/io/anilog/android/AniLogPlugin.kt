@@ -47,6 +47,14 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
       )
       MobileStore.setBangumiApiBaseUrl(activity.applicationContext, if (BuildConfig.isOriginalEdition) "" else args.optString("bangumiApiBaseUrl", ""))
       MobileStore.setPullCollectionsEnabled(activity.applicationContext, !BuildConfig.isOriginalEdition && args.optBoolean("pullCollections", false))
+      val caches = args.optJSONArray("anilistCache") ?: JSONArray()
+      for (index in 0 until caches.length()) {
+        val media = caches.optJSONObject(index) ?: continue
+        val fetchedAt = media.optLong("_fetchedAt")
+        if (fetchedAt > 0 && fetchedAt <= System.currentTimeMillis() / 1000L) {
+          MobileStore.setAnilistScheduleCache(activity.applicationContext, media, fetchedAt)
+        }
+      }
       AniListScheduler.refreshCachedSchedules(activity.applicationContext)
       val current = MobileStore.following(activity.applicationContext)
       val currentIds = (0 until current.length()).mapNotNull { current.optJSONObject(it)?.optInt("id") }.toSet()
@@ -81,9 +89,12 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun syncNow(invoke: Invoke) {
+    val args = invoke.getArgs()
+    val force = args.optBoolean("force", false)
+    val target = args.optInt("target", 0)
     Thread {
       try {
-        val updated = AniListScheduler.sync(activity.applicationContext)
+        val updated = AniListScheduler.sync(activity.applicationContext, force, target)
         invoke.resolve(status(MobileStore.consumeEvents(activity.applicationContext), false).put("updated", updated))
       } catch (error: Exception) { invoke.reject("AniList 同步失败：${error.message}", error) }
     }.start()
@@ -147,8 +158,10 @@ class AniLogPlugin(private val activity: Activity) : Plugin(activity) {
       .put("exactSchedulingGranted", Build.VERSION.SDK_INT < 31 || alarms.canScheduleExactAlarms())
       .put("events", events)
       .put("following", MobileStore.following(activity.applicationContext))
+      .put("anilistCache", MobileStore.exportAnilistCache(activity.applicationContext))
       .put("document", BackgroundSyncWorker.localDocument(activity.applicationContext))
       .put("syncedAt", MobileStore.lastSyncAt(activity.applicationContext))
+      .put("warning", MobileStore.anilistSyncWarning(activity.applicationContext))
       .put("openTasks", consumeOpenTasks && MobileStore.consumeOpenTasks(activity.applicationContext))
   }
 }

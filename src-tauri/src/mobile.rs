@@ -34,10 +34,20 @@ pub fn init() -> TauriPlugin<Wry, ()> {
 
 fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
     let state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
-    Ok(super::mobile_state::configuration_payload(
+    let mut payload = super::mobile_state::configuration_payload(
         &state,
         context.original,
-    ))
+    );
+    let cached: Vec<Value> = super::anilist_cache::following_requests(&state, context.original, 21600)
+        .keys().filter_map(|&id| {
+            let snapshot = super::anilist_cache::read_snapshot(&context.cache_dir.join("anilist-cache"), id)?;
+            if !snapshot.precise(now_seconds()) { return None; }
+            let mut media = snapshot.media;
+            media["_fetchedAt"] = json!(snapshot.fetched_at);
+            Some(media)
+        }).collect();
+    payload["anilistCache"] = json!(cached);
+    Ok(payload)
 }
 
 pub fn configure(app: &AppHandle, context: &AppContext) -> anyhow::Result<Value> {
@@ -66,7 +76,20 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
             value_i64(right.get("airingAt")).cmp(&value_i64(left.get("airingAt")))
         });
     let changed = before != serde_json::to_string(&*state)?;
+    let allowed = super::anilist_cache::following_requests(&state, context.original, 21600);
     drop(state);
+    for media in status["anilistCache"].as_array().into_iter().flatten() {
+        let id = value_i64(media.get("id"));
+        let at = value_i64(media.get("_fetchedAt"));
+        if allowed.contains_key(&id) && at > 0 && at <= now_seconds() {
+            let mut media = media.clone();
+            media.as_object_mut().unwrap().remove("_fetchedAt");
+            let _ = super::anilist_cache::store_snapshot(
+                &context.cache_dir.join("anilist-cache"), id,
+                &super::anilist_cache::Snapshot { fetched_at: at, media },
+            );
+        }
+    }
 
     if changed {
         context.save_state()?;
@@ -184,8 +207,9 @@ pub fn import_legacy_state(app: &AppHandle, context: &AppContext) -> anyhow::Res
     Ok(true)
 }
 
-pub fn sync_native(app: &AppHandle, context: &AppContext) -> anyhow::Result<Value> {
-    let mut status = app.state::<MobileBridge>().run("syncNow", json!({}))?;
+pub fn sync_native_with_policy(app: &AppHandle, context: &AppContext, force: bool, target: i64) -> anyhow::Result<Value> {
+    configure(app, context)?;
+    let mut status = app.state::<MobileBridge>().run("syncNow", json!({"force": force, "target": target}))?;
     let created = merge_status(app, context, &status)?;
     status["created"] = json!(created);
     configure(app, context)?;

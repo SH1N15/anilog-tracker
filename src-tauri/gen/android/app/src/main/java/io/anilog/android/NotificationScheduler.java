@@ -73,6 +73,24 @@ final class NotificationScheduler {
         }
     }
 
+    static void catchUpAniListEpisodes(Context context, JSONObject follow, JSONObject media, long now) {
+        if (follow == null || "bangumi".equals(follow.optString("source")) || !EpisodeSchedule.tracks(follow)) return;
+        long from = Math.max(now - 86400L, follow.optLong("followedAt"));
+        for (String key : new String[] {"airingSchedule", "futureAiringSchedule", "nextAiringEpisode"}) {
+            JSONObject value = media.optJSONObject(key);
+            if (value == null) continue;
+            JSONArray rows = "nextAiringEpisode".equals(key) ? new JSONArray().put(value) : value.optJSONArray("nodes");
+            if (rows == null) continue;
+            for (int index = 0; index < rows.length(); index++) {
+                JSONObject row = rows.optJSONObject(index);
+                if (row != null && row.optLong("airingAt") >= from
+                    && EpisodeSchedule.canNotify(follow, row.optInt("episode"), row.optLong("airingAt"), now)) {
+                    deliverAired(context, follow, row.optInt("episode"), row.optLong("airingAt"), 0);
+                }
+            }
+        }
+    }
+
     static void schedule(Context context, JSONObject follow) {
         int animeId = follow.optInt("id");
         // Bangumi 状态驱动追踪：仅“在看”（doing，或缺省/未知按在看处理）排新集播出闹钟；

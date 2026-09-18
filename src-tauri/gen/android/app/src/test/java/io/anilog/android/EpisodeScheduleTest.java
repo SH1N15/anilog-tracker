@@ -2,11 +2,71 @@ package io.anilog.android;
 
 import static org.junit.Assert.*;
 import java.time.OffsetDateTime;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
 public class EpisodeScheduleTest {
+    @Test
+    public void reportedSeriesUseTheSamePreciseNextAsDesktop() throws Exception {
+        JSONObject fixture;
+        try (InputStream input = getClass().getResourceAsStream("/anilist/schedule-regressions.json")) {
+            assertNotNull(input);
+            fixture = new JSONObject(new String(input.readAllBytes(), StandardCharsets.UTF_8));
+        }
+        long now = fixture.getLong("checkedAt");
+        JSONArray cases = fixture.getJSONArray("cases");
+        for (int index = 0; index < cases.length(); index++) {
+            JSONObject sample = cases.getJSONObject(index);
+            JSONObject follow = follow(sample.getInt("subjectId")).put("anilistId", sample.getInt("anilistId"))
+                .put("episodes", sample.getJSONObject("media").getInt("episodes")).put("followedAt", now);
+            JSONObject media = sample.getJSONObject("media").put("_fetchedAt", now);
+            JSONArray rows = EpisodeSchedule.resolve(follow, sample.getJSONArray("episodes"), media, now);
+            EpisodeSchedule.updateNext(follow, rows, now);
+            JSONObject expected = sample.getJSONObject("expectedNext");
+            assertEquals(expected.getInt("episode"), follow.getInt("nextEpisode"));
+            assertEquals(expected.getLong("episodeId"), follow.getLong("nextEpisodeId"));
+            assertEquals(expected.getLong("airingAt"), follow.getLong("nextAiringAt"));
+            assertEquals("instant", follow.getString("nextAiringPrecision"));
+            assertFalse(EpisodeSchedule.canNotify(follow, follow.getInt("nextEpisode"), follow.getLong("nextAiringAt"), now));
+            assertEquals(0, EpisodeSchedule.reconcileTasks(follow, new JSONArray(), rows, true, now).length());
+            JSONArray cached = EpisodeSchedule.resolve(follow, sample.getJSONArray("episodes"), null, now + 3600);
+            EpisodeSchedule.updateNext(follow, cached, now + 3600);
+            assertEquals(expected.getLong("airingAt"), follow.getLong("nextAiringAt"));
+        }
+    }
+
+    @Test
+    public void oneDateAnchorCannotRebindSplitSubjectNumbering() throws Exception {
+        long now = at("2026-09-14T08:30:00+08:00");
+        JSONArray episodes = new JSONArray().put(episode(1, 13, "2026-07-05"))
+            .put(episode(12, 24, "2026-09-27"));
+        JSONObject media = media(12, "2026-09-20T16:00:00+08:00", now)
+            .put("airingSchedule", new JSONObject().put("nodes", new JSONArray()
+                .put(new JSONObject().put("episode", 1).put("airingAt", at("2026-07-05T16:00:00+08:00")))));
+        JSONArray rows = EpisodeSchedule.resolve(follow(638497), episodes, media, now);
+        assertFalse(EpisodeSchedule.precise(EpisodeSchedule.find(rows, 12)));
+    }
+
+    @Test
+    public void futureCoincidenceCannotOverrideHistoricalNumbering() throws Exception {
+        long now = at("2026-09-14T08:30:00+08:00");
+        JSONArray episodes = new JSONArray().put(episode(1, 13, "2026-07-05"))
+            .put(episode(2, 14, "2026-07-12")).put(episode(12, 24, "2026-09-27"))
+            .put(episode(13, 25, "2026-10-04"));
+        JSONObject media = media(12, "2026-09-20T16:00:00+08:00", now)
+            .put("airingSchedule", new JSONObject().put("nodes", new JSONArray()
+                .put(new JSONObject().put("episode", 1).put("airingAt", at("2026-07-05T16:00:00+08:00")))
+                .put(new JSONObject().put("episode", 2).put("airingAt", at("2026-07-12T16:00:00+08:00")))))
+            .put("futureAiringSchedule", new JSONObject().put("nodes", new JSONArray()
+                .put(new JSONObject().put("episode", 13).put("airingAt", at("2026-09-27T16:00:00+08:00")))));
+        JSONArray rows = EpisodeSchedule.resolve(follow(638497), episodes, media, now);
+        assertEquals(at("2026-09-20T16:00:00+08:00"), EpisodeSchedule.find(rows, 12).getLong("airingAt"));
+        assertEquals(at("2026-09-27T16:00:00+08:00"), EpisodeSchedule.find(rows, 13).getLong("airingAt"));
+    }
+
     @Test
     public void originalRejectsBangumiBeforeAccessingStorageOrNetwork() throws Exception {
         if (BuildConfig.isOriginalEdition) {
@@ -105,8 +165,11 @@ public class EpisodeScheduleTest {
         assertEquals(0, EpisodeSchedule.reconcileTasks(follow, new JSONArray().put(falseTask), rows, true, morning).length());
         assertEquals(1, EpisodeSchedule.reconcileTasks(follow, new JSONArray(), rows, true, evening).length());
         falseTask.put("status", "completed").put("completedAt", morning);
-        assertEquals(falseTask.toString(),
-            EpisodeSchedule.reconcileTasks(follow, new JSONArray().put(falseTask), rows, true, morning).getJSONObject(0).toString());
+        JSONObject retained = EpisodeSchedule.reconcileTasks(follow, new JSONArray().put(falseTask), rows, true, morning).getJSONObject(0);
+        assertEquals("completed", retained.getString("status"));
+        assertEquals(falseTask.getLong("completedAt"), retained.getLong("completedAt"));
+        assertEquals(falseTask.getLong("createdAt"), retained.getLong("createdAt"));
+        assertTrue(WatchHistory.needsReview(retained));
     }
 
     @Test
@@ -145,5 +208,19 @@ public class EpisodeScheduleTest {
             media(16, "2026-09-09T20:00:00+08:00", now - 60), now + 1);
         assertEquals(at("2026-09-09T21:00:00+08:00"), stale.getJSONObject(0).getLong("airingAt"));
         assertEquals(now, stale.getJSONObject(0).getLong("precisionFetchedAt"));
+    }
+
+    @Test
+    public void futureScheduleCacheKeepsOriginalFetchTime() throws Exception {
+        long now = at("2026-09-09T12:00:00+08:00");
+        JSONObject follow = follow(633836);
+        JSONArray episodes = new JSONArray().put(episode(5, 82, "2026-09-09"));
+        JSONObject cached = new JSONObject().put("id", 189046).put("_fetchedAt", now - 60)
+            .put("futureAiringSchedule", new JSONObject().put("nodes", new JSONArray()
+                .put(new JSONObject().put("episode", 82).put("airingAt", now + 3600))));
+        JSONArray rows = EpisodeSchedule.resolve(follow, episodes, cached, now);
+        assertEquals(now + 3600, rows.getJSONObject(0).getLong("airingAt"));
+        assertEquals(now - 60, rows.getJSONObject(0).getLong("precisionFetchedAt"));
+        assertTrue(EpisodeSchedule.precise(rows.getJSONObject(0)));
     }
 }

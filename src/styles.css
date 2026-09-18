@@ -25,6 +25,10 @@ button, input, select { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(39, 116, 78, .22); outline-offset: 2px; }
 
+.app-bootstrap { min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 32px; text-align: center; }
+.app-bootstrap strong { font-size: 22px; }
+.app-bootstrap p { display: flex; align-items: center; gap: 10px; margin: 0; color: var(--muted); font-size: 14px; }
+.app-bootstrap > span { max-width: 480px; overflow-wrap: anywhere; color: var(--coral); font-size: 12px; }
 .app-shell { display: grid; grid-template-columns: 224px minmax(0, 1fr); height: 100vh; background: #f5f6f4; }
 .sidebar { min-width: 0; padding: 22px 14px 16px; color: #eff5f1; background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid #0d1511; }
 .brand { display: flex; align-items: center; gap: 11px; width: 100%; padding: 3px 8px 23px; color: inherit; background: none; border: 0; text-align: left; cursor: pointer; }
@@ -51,7 +55,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .topbar p { margin: 0 0 3px; color: var(--muted); font-size: 11px; }
 .topbar h1 { margin: 0; font-size: 21px; line-height: 1.2; }
 .topbar-actions { display: flex; align-items: center; gap: 9px; }
-.sync-message { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.sync-message { max-width: 320px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.mobile-sync-message { display: none; }
 .icon-button { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 38px; padding: 0; border: 1px solid var(--line); border-radius: 6px; color: #4f5853; background: #fff; cursor: pointer; }
 .icon-button:hover { border-color: #b8c0bb; background: #f7f8f7; }
 .icon-button:disabled { opacity: .55; cursor: default; }
@@ -153,7 +158,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .task-summary span { color: var(--muted); font-size: 10px; }
 .task-summary strong { margin: 5px 0 4px; font-size: 27px; }
 .task-summary small { color: #939a96; font-size: 9px; }
-.task-tabs { flex: 0 0 auto; }
+.task-tabs { flex: 0 0 auto; flex-wrap: wrap; }
 .task-list, .following-list { display: grid; gap: 8px; }
 /* Bangumi 状态分组小节标题（问题 4：可折叠，chevron 指示展开/收起；收起时组头仍显示数量） */
 .following-group-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 18px 0 13px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
@@ -197,6 +202,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .finale-rating button:disabled { opacity: .55; cursor: default; }
 .task-row { min-width: 0; min-height: 70px; display: grid; grid-template-columns: 34px 38px minmax(170px, 1fr) minmax(180px, .7fr) 70px; align-items: center; gap: 12px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
 .task-row.completed { opacity: .62; }
+.task-row.history-review { border-color: #dcb995; }
+.history-review .task-check, .task-copy small { color: #985421; }
+.task-copy small { display: block; margin-top: 5px; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.history-review-actions { display: flex; gap: 4px; justify-self: end; }
+.history-review-actions .icon-button { width: 32px; height: 32px; flex-basis: 32px; }
+.task-check:disabled { cursor: default; }
 .task-check { display: grid; place-items: center; padding: 0; border: 0; color: #a7afa9; background: none; cursor: pointer; }
 .task-check:hover, .task-row.completed .task-check { color: var(--green); }
 .task-row > img, .cover-placeholder { width: 38px; height: 52px; display: block; border-radius: 4px; object-fit: cover; background: #dfe4e0; }
@@ -321,6 +332,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .main-content { height: auto; min-height: 100vh; display: block; overflow: visible; padding-bottom: 62px; }
   .topbar { height: 68px; }
   .topbar p, .sync-message, .inbox-button span { display: none; }
+  .mobile-sync-message { display: block; margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .topbar h1 { font-size: 18px; }
   .view-container { overflow: visible; padding: 18px 14px 32px; }
   .season-toolbar { align-items: stretch; flex-direction: column; }
@@ -363,6 +375,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .task-row { grid-template-columns: 28px 34px minmax(0, 1fr) auto; gap: 8px; padding: 8px; }
   .task-row > img, .cover-placeholder { width: 34px; height: 47px; }
   .task-time { display: none; }
+  .history-review .task-time { display: flex; grid-column: 3 / -1; grid-row: 2; }
+  .history-review-actions { grid-column: 4; grid-row: 1; }
   .task-state { padding: 4px; }
   .following-row { grid-template-columns: 47px minmax(0, 1fr) 36px; gap: 10px; }
   .following-row > img { width: 47px; height: 66px; }

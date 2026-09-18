@@ -34,7 +34,7 @@ Local-first anime schedule, notification, episode task manager, optional Bangumi
 
 ### 正式版 v0.7.4
 
-当前本地与 GitHub 均以 `v0.7.4` 为稳定基线，暂不开展下一版优化。已有正式安装包和下载链接保持不变。
+GitHub 正式版仍以 `v0.7.4` 为稳定基线，已有正式安装包和下载链接保持不变。本地候选版 `v0.7.5-rc.3` 继续修正异常完成历史和观看进度，尚未公开发布。
 
 - [`AniLog-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Windows-v0.7.4-x64-setup.exe)：Windows 标准版
 - [`AniLog-Original-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Original-Windows-v0.7.4-x64-setup.exe)：Windows 原名版

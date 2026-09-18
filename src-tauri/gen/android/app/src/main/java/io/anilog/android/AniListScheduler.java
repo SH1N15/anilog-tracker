@@ -10,15 +10,16 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 final class AniListScheduler {
     private static final String ENDPOINT = "https://graphql.anilist.co";
-    private static final String QUERY = "query MobileSchedules($ids: [Int]) { Page(page: 1, perPage: 50) { media(type: ANIME, id_in: $ids) { id coverImage { medium } nextAiringEpisode { episode airingAt } airingSchedule(notYetAired: false, perPage: 50) { nodes { episode airingAt } } } } }";
+    static final String QUERY = "query MobileSchedules($ids: [Int]) { Page(page: 1, perPage: 50) { media(type: ANIME, id_in: $ids) { id status coverImage { medium } nextAiringEpisode { episode airingAt } airingSchedule(notYetAired: false, perPage: 50) { nodes { episode airingAt } } futureAiringSchedule: airingSchedule(notYetAired: true, perPage: 50) { nodes { episode airingAt } } } } }";
     private static final long BANGUMI_EPISODES_CACHE_TTL_SECONDS = 24L * 60L * 60L;
     private static final long ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS = 7L * 24L * 60L * 60L;
     private static final int ANILIST_SAFE_REQUESTS_PER_MINUTE = 30;
@@ -27,37 +28,43 @@ final class AniListScheduler {
     private AniListScheduler() {}
 
     static synchronized int sync(Context context) throws IOException, JSONException {
+        return sync(context, false, 0);
+    }
+
+    static synchronized int sync(Context context, boolean force, int target) throws IOException, JSONException {
         Context app = context.getApplicationContext();
-        int updated = BuildConfig.isOriginalEdition ? 0 : syncBangumiEpisodeSchedules(app);
+        int updated = BuildConfig.isOriginalEdition ? 0 : syncBangumiEpisodeSchedules(app, force, target);
         JSONArray following = MobileStore.following(app);
-        Set<Integer> requested = new HashSet<>();
-        for (int offset = 0; offset < following.length(); offset += 50) {
+        long now = System.currentTimeMillis() / 1000L;
+        Map<Integer, Long> requested = AniListRequestPolicy.requests(following, BuildConfig.isOriginalEdition, 6L * 3600L, target);
+        List<Integer> missing = new ArrayList<>();
+        for (Map.Entry<Integer, Long> entry : requested.entrySet()) {
+            JSONObject cached = MobileStore.anilistScheduleCache(app, entry.getKey(), now, Long.MAX_VALUE);
+            if (AniListRequestPolicy.needsRefresh(cached, now, entry.getValue(), force)) missing.add(entry.getKey());
+        }
+        IOException failure = null;
+        for (int offset = 0; offset < missing.size(); offset += 50) {
             JSONArray ids = new JSONArray();
-            for (int index = offset; index < Math.min(offset + 50, following.length()); index++) {
-                JSONObject follow = following.optJSONObject(index);
-                if (follow == null) continue;
-                int id = !BuildConfig.isOriginalEdition && "bangumi".equals(follow.optString("source"))
-                    ? follow.optInt("anilistId", 0) : follow.optInt("id");
-                if (id > 0 && requested.add(id)) ids.put(id);
-            }
-            if (ids.length() == 0) continue;
-            JSONArray media;
+            for (int index = offset; index < Math.min(offset + 50, missing.size()); index++) ids.put(missing.get(index));
             try {
-                media = request(ids);
+                JSONArray media = AniListRequestPolicy.validResponse(ids, request(app, ids));
+                for (int index = 0; index < media.length(); index++) {
+                    MobileStore.setAnilistScheduleCache(app, media.getJSONObject(index), now);
+                }
             } catch (IOException | JSONException error) {
-                if (BuildConfig.isOriginalEdition) throw error;
                 MobileStore.setLastSyncError(app, "AniList supplement unavailable");
-                continue;
+                failure = new IOException("AniList supplement unavailable", error);
+                break;
             }
-            for (int index = 0; index < media.length(); index++) {
-                JSONObject item = media.optJSONObject(index);
-                if (item == null) continue;
+        }
+        for (Integer requestedId : requested.keySet()) {
+                JSONObject item = MobileStore.anilistScheduleCache(app, requestedId, now, ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS);
+                if (item == null || item.optBoolean("_missing")) continue;
                 int id = item.optInt("id");
-                JSONObject next = item.optJSONObject("nextAiringEpisode");
+                JSONObject next = AniListRequestPolicy.nextEpisode(item, now);
                 JSONObject cover = item.optJSONObject("coverImage");
                 String image = cover == null ? null : cover.optString("medium", null);
                 if (!BuildConfig.isOriginalEdition) {
-                    MobileStore.setAnilistScheduleCache(app, item, System.currentTimeMillis() / 1000L);
                     JSONArray current = MobileStore.following(app);
                     boolean matched = false;
                     for (int f = 0; f < current.length(); f++) {
@@ -73,19 +80,30 @@ final class AniListScheduler {
                         continue;
                     }
                 }
+                JSONObject follow = MobileStore.findFollow(app, id);
+                if (follow == null || "bangumi".equals(follow.optString("source"))) continue;
+                NotificationScheduler.catchUpAniListEpisodes(app, follow, item, now);
                 MobileStore.updateSchedule(app, id,
                     next == null ? null : next.optInt("episode"),
                     next == null ? null : next.optLong("airingAt"), image);
                 updated++;
-            }
         }
+        MobileStore.setAnilistSyncWarning(app, failure == null ? ""
+            : "en-US".equals(MobileStore.uiLanguage(app))
+                ? "AniList schedules could not be refreshed; cached data was retained"
+                : "AniList 日程获取失败，已保留现有缓存");
         // No alarms are scheduled against an intermediate date-only snapshot.
         NotificationScheduler.scheduleAll(app);
         MobileStore.setLastSyncAt(app, System.currentTimeMillis() / 1000L);
+        if (failure != null && BuildConfig.isOriginalEdition && updated == 0) throw failure;
         return updated;
     }
 
     static synchronized int syncBangumiEpisodeSchedules(Context context) throws IOException, JSONException {
+        return syncBangumiEpisodeSchedules(context, false, 0);
+    }
+
+    static synchronized int syncBangumiEpisodeSchedules(Context context, boolean force, int target) throws IOException, JSONException {
         if (BuildConfig.isOriginalEdition) return 0;
         JSONArray following = MobileStore.following(context);
         int updated = 0;
@@ -93,10 +111,10 @@ final class AniListScheduler {
             JSONObject follow = following.optJSONObject(index);
             if (follow == null || !"bangumi".equals(follow.optString("source"))) continue;
             int subject = follow.optInt("id");
-            if (subject <= 0) continue;
+            if (subject <= 0 || (target > 0 && subject != target)) continue;
             JSONArray episodes;
             try {
-                episodes = loadBangumiEpisodes(context, subject);
+                episodes = loadBangumiEpisodes(context, subject, force);
             } catch (IOException | JSONException error) {
                 continue;
             }
@@ -129,10 +147,10 @@ final class AniListScheduler {
             System.currentTimeMillis() / 1000L, ANILIST_PRECISE_CACHE_MAX_AGE_SECONDS);
     }
 
-    private static JSONArray loadBangumiEpisodes(Context context, int subject) throws IOException, JSONException {
+    private static JSONArray loadBangumiEpisodes(Context context, int subject, boolean force) throws IOException, JSONException {
         long now = System.currentTimeMillis() / 1000L;
         JSONArray fresh = MobileStore.bangumiEpisodesCache(
-            context, subject, now, BANGUMI_EPISODES_CACHE_TTL_SECONDS, true);
+            context, subject, now, force ? AniListRequestPolicy.MANUAL_COOLDOWN : BANGUMI_EPISODES_CACHE_TTL_SECONDS, true);
         if (fresh != null) return fresh;
         try {
             JSONArray episodes = requestBangumiEpisodes(context, subject);
@@ -179,7 +197,10 @@ final class AniListScheduler {
         throw new IOException("Episode list pagination limit");
     }
 
-    private static JSONArray request(JSONArray ids) throws IOException, JSONException {
+    private static JSONArray request(Context context, JSONArray ids) throws IOException, JSONException {
+        if (MobileStore.anilistRetryAt(context) > System.currentTimeMillis() / 1000L) {
+            throw new IOException("AniList request cooling down");
+        }
         awaitAniListPermit();
         JSONObject payload = new JSONObject().put("query", QUERY).put("variables", new JSONObject().put("ids", ids));
         HttpURLConnection connection = (HttpURLConnection) new URL(ENDPOINT).openConnection();
@@ -192,20 +213,27 @@ final class AniListScheduler {
         connection.setRequestProperty("Origin", "https://anilist.co");
         connection.setRequestProperty("Referer", "https://anilist.co/");
         connection.setRequestProperty("User-Agent", userAgent());
+        int status = 0;
+        String retryAfter = null;
+        boolean success = false;
         try {
             byte[] body = payload.toString().getBytes(StandardCharsets.UTF_8);
             connection.setFixedLengthStreamingMode(body.length);
             try (OutputStream output = connection.getOutputStream()) { output.write(body); }
-            int status = connection.getResponseCode();
+            status = connection.getResponseCode();
+            retryAfter = connection.getHeaderField("Retry-After");
             if (status < 200 || status >= 300) throw new IOException("AniList HTTP " + status);
             JSONObject root = new JSONObject(readAll(connection.getInputStream()));
-            if (root.has("errors")) throw new IOException("AniList returned GraphQL errors");
+            JSONArray errors = root.optJSONArray("errors");
+            if (errors != null && errors.length() > 0) throw new IOException("AniList returned GraphQL errors");
             JSONObject data = root.optJSONObject("data");
             JSONObject page = data == null ? null : data.optJSONObject("Page");
             JSONArray media = page == null ? null : page.optJSONArray("media");
             if (media == null) throw new IOException("AniList returned invalid schedule data");
+            success = true;
             return media;
         } finally {
+            MobileStore.recordAnilistRequest(context, success, status, retryAfter);
             connection.disconnect();
         }
     }

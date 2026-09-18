@@ -42,14 +42,16 @@ function subscribe<T>(event: string, callback: (payload: T) => void): () => void
 
 export const tauriApi: DesktopApi = {
   getState: () => invoke<AppState>('get_state'),
-  fetchSeason: (params: { season: Season; year: number }) => invoke<Anime[]>('fetch_season', { params }),
+  fetchSeason: (params: { season: Season; year: number; force?: boolean }) => invoke<Anime[]>('fetch_season', { params }),
   toggleFollow: (anime: Anime) => invoke<AppState>('toggle_follow', { anime }),
+  unfollow: (animeId: number) => invoke<AppState>('unfollow', { animeId }),
   updateFollowTitle: (animeId: number, displayTitle: string) => invoke<AppState>('update_follow_title', { animeId, displayTitle }),
   resolveBangumiTitle: (anime: Anime) => invoke<BangumiTitleMatch>('resolve_bangumi_title', { anime }),
   testBangumiConnection: (baseUrl: string) => invoke<ConnectionTestResult>('test_bangumi_connection', { baseUrl }),
   toggleTask: (taskId: string) => invoke<AppState>('toggle_task', { taskId }),
+  resolveTaskReview: (taskId: string, keepCompleted: boolean) => invoke<AppState>('resolve_task_review', { taskId, keepCompleted }),
   updateSettings: (settings: Partial<Settings>) => invoke<AppState>('update_settings', { settings }),
-  syncNow: () => invoke<{ created: number; syncedAt: number }>('sync_now'),
+  syncNow: () => invoke<{ created: number; syncedAt: number; warning?: string }>('sync_now'),
   getCacheInfo: () => invoke<CacheInfo>('get_cache_info'),
   clearCache: () => invoke<CacheInfo>('clear_cache'),
   getWebDavConfig: () => invoke<WebDavConfig>('get_webdav_config'),

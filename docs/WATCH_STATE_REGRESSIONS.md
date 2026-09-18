@@ -81,3 +81,121 @@ The verified baseline is 171 Standard Rust tests, 30 Original Rust tests,
 checks at 320, 390, 768, and 1280 pixels. These automated checks and the
 maintainer's acceptance are separate evidence; neither establishes behavior
 on every Android device.
+
+## Unreleased Follow And Collection Sync
+
+The following contracts were added after the v0.7.4 release. They do not imply
+that the published packages or the maintainer's installed apps contain the fixes.
+
+- Unfollowing is an idempotent command, not a toggle that can accidentally
+  re-add an already removed record. Completed history remains intact.
+- Rust and Android apply the same timestamp comparison in both merge
+  directions. A historical `localFollowIntentAt` cannot bypass a newer
+  deletion or override a newer edit from another device.
+- Bangumi `doing` is not proof of a new follow intent. A deletion tombstone
+  blocks automatic reimport, including when collection upload is disabled.
+  Explicitly following the subject again clears the local deletion intent.
+- Equal collection values are convergence, not a conflict. Remote-only
+  comments, tags, and privacy settings do not create a conflict in fields
+  AniLog does not edit.
+- The persisted `latest` policy retains unacknowledged local edits because
+  Bangumi does not expose a reliable rating/progress edit timestamp. Its UI
+  label must not promise timestamp ordering that the API cannot support.
+  `bangumi-first` resolves actual differing-value conflicts in favor of
+  Bangumi; unchanged remote content must not undo a local edit.
+- Pulling never writes to the account. `local-first` cannot bypass the upload
+  switches. Failed writes remain pending; only the sent payload is acknowledged.
+- A rating cleared by the user carries `localRatingUpdatedAt` in milliseconds
+  and uploads `rate=0`. A missing, never-edited rating remains unknown and does
+  not reset a pre-existing remote rating.
+- Network plans recheck deletions and record revisions before applying a pull
+  or sending an upload. Manual and automatic Rust collection sync transactions
+  share one lock. Android receives local rating/status edits before a later
+  native snapshot can be merged.
+- With Bangumi account sync enabled, the top-bar sync action runs the full
+  sync transaction, including its gated upload phase, rather than only fetching
+  airing schedules. Original keeps its AniList-only path.
+
+Regression entry points:
+[cross-device and collection intent tests](../src-tauri/src/sync_intent_tests.rs)
+and [Android merge tests](../src-tauri/gen/android/app/src/test/java/io/anilog/android/SyncMergeTest.java).
+The older collection-policy tests now use genuinely different local and
+remote values; a test expecting equal values to conflict or a deleted follow
+to be automatically restored is not a valid acceptance criterion.
+
+## Rc.2 Schedule And Startup
+
+- `Media.airingSchedule` does not accept `sort`. Invalid GraphQL arguments
+  reject the whole batch, not just one media row. Mock responses alone cannot
+  validate upstream query compatibility; keep the argument-contract tests.
+- Bangumi `ep` and `sort` may differ while AniList still uses the local season
+  number. Two distinct, unique aired-history calendar matches must establish that numbering
+  before applying a changed AniList date by local episode. One match or a
+  conflicting historical match must not rebind a shared/split season.
+  A future date coincidence after a schedule change is not numbering evidence.
+- An episode with a Bangumi ID but no date may use the timestamp from an
+  already matched AniList episode. No identity, no invented schedule.
+- Adding a follow reuses verified local caches and refreshes only that work.
+  Do not copy an unverified quarterly broadcast estimate into its alarm.
+- Manual refresh honors a one-minute floor for both AniList and Bangumi
+  episode caches; automatic requests retain their normal longer lifetime.
+- Native state is initialized before exposing commands to the UI. Android
+  `get_state` performs bridge reads off the UI thread and retains the loaded
+  local snapshot when native refresh is temporarily unavailable.
+- Before the first real state snapshot, render loading/retry UI, not empty
+  following lists or default settings. Startup read retries are bounded;
+  disposal or a newer pushed snapshot cancels them. Resume errors retain
+  the last real state instead of restarting polling.
+- Serialize state saves through the temporary-file rename and flush the
+  new file before replacing the old one. An unreadable existing state file
+  must not be silently overwritten with defaults.
+- Failed schedule requests remain visible in manual/full-sync results,
+  including the narrow Android layout.
+
+The [shared public-data fixture](../src-tauri/fixtures/anilist/schedule-regressions.json)
+records subjects 607340/638497 and AniList 202269/210031. On 2026-09-14 the
+public APIs returned the next verified instants 2026-09-14 20:00 and
+2026-09-20 16:00 (UTC+8), respectively. These are dated regression samples,
+not promises that the upstream schedules will never change.
+
+Additional entry points:
+[Rust startup and schedule regressions](../src-tauri/src/startup_schedule_tests.rs),
+[frontend bootstrap races](../scripts/test-state-refresh.cjs), and the
+Android episode tests above. ADB had no connected device for this session;
+simulated cold starts do not replace the maintainer's force-stop/reopen test.
+
+## Rc.3 Completion Review
+
+- Keeping a completed record is not equivalent to trusting it for progress.
+  Verified per-episode future facts mark a completion with `completionReview`.
+  Preserve its ID, original status, timestamps, and prior upload evidence.
+- Only `airingSource=bangumi_episode` with a positive episode ID and known
+  `instant` or future-day `date` precision can trigger automatic review.
+  A next-episode pointer or today's unknown broadcast time is not proof.
+- `completionReview.decision=review` is excluded from completed counts,
+  progress, and Bangumi uploads. It remains in `tasks` and WebDAV history,
+  and remains under review even after its scheduled time passes.
+- Progress can decrease automatically only when the previous aggregate
+  equals the full local set including reviewed/reset episodes. Incomplete
+  local history must not reduce an unrelated remote aggregate.
+- An explicit user review sets `decision=keep` or `reset`. Keep restores its
+  counted completion. Reset records local intent as `pending`, retains the
+  original completion in review metadata, and becomes a watch task only after
+  airing. Future-time cleanup must preserve this explicit correction so an
+  old device cannot restore the obsolete completion.
+- Only explicit local completion/undo intent may automatically write episode
+  progress to Bangumi. Legacy `completed` records without provenance are not
+  upload intentions. Recheck episode snapshots before sending and acknowledge
+  only the sent revision.
+- Review actions require confirmation and use an idempotent resolution
+  command. Retrying the old action must not toggle the result.
+- The actual delayed schedule stays upstream-controlled. On the later
+  2026-09-14 check, both public sources placed subject 638497 episode 12 on
+  September 27 (AniList: 16:00 UTC+8), not September 20. Never repair a
+  progress problem by guessing a different broadcast date.
+
+Tests:
+[Rust review kernel](../src-tauri/src/watch_history.rs),
+[Rust progress and old-snapshot regressions](../src-tauri/src/watch_progress_tests.rs),
+[Android review kernel](../src-tauri/gen/android/app/src/test/java/io/anilog/android/WatchHistoryTest.java),
+[frontend task history](../scripts/test-task-history.cjs).

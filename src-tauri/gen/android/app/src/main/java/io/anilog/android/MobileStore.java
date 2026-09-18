@@ -84,6 +84,9 @@ final class MobileStore {
                     }
                 }
             }
+            if (!BuildConfig.isOriginalEdition) {
+                WatchHistory.reconcile(mergedFollowing, result.merged.getJSONArray("tasks"), System.currentTimeMillis() / 1000L);
+            }
             prefs(context).edit()
                 .putString(FOLLOWING, mergedFollowing.toString())
                 .putString(PENDING_TASKS, result.merged.getJSONArray("tasks").toString())
@@ -194,7 +197,7 @@ final class MobileStore {
         JSONArray pending = new JSONArray();
         for (int index = 0; index < all.length(); index += 1) {
             JSONObject task = all.optJSONObject(index);
-            if (task != null && !"completed".equals(task.optString("status", "pending"))) {
+            if (task != null && WatchHistory.isPending(task, System.currentTimeMillis() / 1000L)) {
                 pending.put(task);
             }
         }
@@ -257,7 +260,7 @@ final class MobileStore {
                     JSONObject pendingTask = pendingTasks.optJSONObject(index);
                     if (pendingTask != null && id.equals(pendingTask.optString("id"))) {
                         taskKnown = true;
-                        if ("completed".equals(pendingTask.optString("status"))) alreadyDelivered = true;
+                        if (WatchHistory.isCompleted(pendingTask)) alreadyDelivered = true;
                         break;
                     }
                 }
@@ -319,6 +322,7 @@ final class MobileStore {
                 if (rows.length() == 0) return; // Missing data is not a cancellation.
                 JSONArray tasks = EpisodeSchedule.reconcileTasks(
                     follow, readArray(context, PENDING_TASKS), rows, createTasksEnabled(context), now);
+                WatchHistory.reconcile(following, tasks, now);
                 EpisodeSchedule.updateNext(follow, rows, now);
                 follow.put("scheduleUpdatedAt", System.currentTimeMillis());
                 JSONArray delivered = readArray(context, DELIVERED);
@@ -370,6 +374,9 @@ final class MobileStore {
     static SyncMerge.Result mergeDocument(Context context, JSONObject remote) throws JSONException, SyncMerge.MergeException {
         synchronized (LOCK) {
             SyncMerge.Result result = SyncMerge.merge(BackgroundSyncWorker.localDocument(context), remote);
+            if (!BuildConfig.isOriginalEdition) {
+                WatchHistory.reconcile(result.merged.getJSONArray("following"), result.merged.getJSONArray("tasks"), System.currentTimeMillis() / 1000L);
+            }
             setFollowing(context, result.merged.getJSONArray("following"));
             setTasks(context, result.merged.getJSONArray("tasks"));
             setTombstones(context, result.merged.getJSONObject("followingDeletedAt"));
@@ -483,7 +490,7 @@ final class MobileStore {
             JSONObject envelope = new JSONObject(raw);
             long fetchedAt = envelope.optLong("fetchedAt", 0);
             JSONObject media = envelope.optJSONObject("media");
-            if (fetchedAt <= 0 || media == null || nowSeconds - fetchedAt > maxAgeSeconds) return null;
+            if (media == null || !AniListRequestPolicy.fresh(fetchedAt, nowSeconds, maxAgeSeconds)) return null;
             return new JSONObject(media.toString()).put("_fetchedAt", fetchedAt);
         } catch (JSONException ignored) {
             return null;
@@ -494,6 +501,9 @@ final class MobileStore {
         if (media == null || fetchedAtSeconds <= 0) return;
         int anilistId = media.optInt("id", 0);
         if (anilistId <= 0) return;
+        synchronized (LOCK) {
+        JSONObject old = anilistScheduleCache(context, anilistId, System.currentTimeMillis() / 1000L, Long.MAX_VALUE);
+        if (old != null && old.optLong("_fetchedAt") >= fetchedAtSeconds) return;
         try {
             JSONObject envelope = new JSONObject();
             envelope.put("fetchedAt", fetchedAtSeconds);
@@ -502,6 +512,37 @@ final class MobileStore {
                 .putString(ANILIST_SCHEDULE_CACHE_PREFIX + anilistId, envelope.toString())
                 .apply();
         } catch (JSONException ignored) {}
+        }
+    }
+
+    static JSONArray exportAnilistCache(Context context) {
+        JSONArray result = new JSONArray();
+        for (Integer id : AniListRequestPolicy.requests(following(context), BuildConfig.isOriginalEdition, 21600L, 0).keySet()) {
+            JSONObject media = anilistScheduleCache(context, id, System.currentTimeMillis() / 1000L, 30L * 86400L);
+            if (media != null) result.put(media);
+        }
+        return result;
+    }
+
+    static long anilistRetryAt(Context context) {
+        return prefs(context).getLong("anilist_retry_at", 0L);
+    }
+
+    static String anilistSyncWarning(Context context) {
+        return prefs(context).getString("anilist_sync_warning", "");
+    }
+
+    static void setAnilistSyncWarning(Context context, String warning) {
+        prefs(context).edit().putString("anilist_sync_warning", warning).apply();
+    }
+
+    static void recordAnilistRequest(Context context, boolean success, int status, String retryAfter) {
+        synchronized (LOCK) {
+            int failures = success ? 0 : Math.min(16, prefs(context).getInt("anilist_failures", 0) + 1);
+            long now = System.currentTimeMillis() / 1000L;
+            long retryAt = success ? 0 : now + AniListRequestPolicy.retryDelay(status, retryAfter, failures, now);
+            prefs(context).edit().putInt("anilist_failures", failures).putLong("anilist_retry_at", retryAt).apply();
+        }
     }
 
     /** 是否拉取 Bangumi 收藏（默认开；original 永不拉取，与设置无关）。 */

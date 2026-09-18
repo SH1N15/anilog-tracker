@@ -47,6 +47,47 @@ public class SyncMergeTest {
         assertSame(regenerated, SyncMerge.chooseRecord(completed, regenerated, "createdAt"));
     }
 
+    @Test
+    public void staleFollowIntentCannotUndoANewerDeletion() throws Exception {
+        for (long lastPull : new long[] {0, 1}) {
+            JSONObject old = doc(array(followed(1, 2000)
+                    .put("localFollowIntentAt", 2000L)
+                    .put("lastPulledFromBangumiAt", lastPull)),
+                array(task("1-1", 1, "completed", 2000), task("1-2", 1, "pending", 2000)), null);
+            JSONObject deleted = doc(null, null, new JSONObject().put("1", 3000L));
+            for (JSONObject[] pair : new JSONObject[][] {{old, deleted}, {deleted, old}}) {
+                JSONObject merged = SyncMerge.merge(pair[0], pair[1]).merged;
+                for (int repeat = 0; repeat < 3; repeat++) {
+                    merged = SyncMerge.merge(merged, old).merged;
+                    assertEquals(0, merged.getJSONArray("following").length());
+                    assertEquals(1, merged.getJSONArray("tasks").length());
+                    assertEquals("completed", merged.getJSONArray("tasks").getJSONObject(0).getString("status"));
+                    assertEquals(3000, tombstone(merged, 1));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void oldFollowIntentDoesNotOverrideNewerDeviceEdits() throws Exception {
+        JSONObject old = doc(array(followed(1, 2000).put("localFollowIntentAt", 1000L).put("rating", 2)), null, null);
+        JSONObject newer = doc(array(followed(1, 3000).put("localFollowIntentAt", 1000L).put("rating", 9)), null, null);
+        JSONObject forward = SyncMerge.merge(old, newer).merged;
+        JSONObject reverse = SyncMerge.merge(newer, old).merged;
+        assertEquals(9, forward.getJSONArray("following").getJSONObject(0).getInt("rating"));
+        assertTrue(SyncMerge.sameBusinessDocument(forward, reverse));
+    }
+
+    @Test
+    public void explicitRefollowNewerThanDeletionStillSurvives() throws Exception {
+        JSONObject local = doc(array(followed(1, 4000).put("localFollowIntentAt", 4000L)), null, null);
+        JSONObject remote = doc(null, null, new JSONObject().put("1", 3000L));
+        JSONObject merged = SyncMerge.merge(local, remote).merged;
+        assertEquals(1, merged.getJSONArray("following").length());
+        assertEquals(0, tombstone(merged, 1));
+        assertTrue(SyncMerge.sameBusinessDocument(merged, SyncMerge.merge(remote, local).merged));
+    }
+
     private static JSONObject followed(long id, long syncUpdatedAt) throws Exception {
         JSONObject item = new JSONObject();
         item.put("id", id);

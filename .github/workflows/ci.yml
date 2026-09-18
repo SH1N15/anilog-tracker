@@ -55,6 +55,9 @@ jobs:
       - name: Test unfollow task retention
         run: npm run test:task-retention
 
+      - name: Test watch history review
+        run: npm run test:task-history
+
       - name: Test daily task reminders
         run: npm run test:daily-task-reminder
 

@@ -86,6 +86,14 @@ export interface WatchTask {
   airingPrecision?: 'instant' | 'date' | 'unknown';
   status: 'pending' | 'completed';
   statusSource?: 'airing' | 'local' | 'bangumi';
+  completionReview?: {
+    decision: 'review' | 'keep' | 'reset';
+    reason: 'before_airing';
+    detectedAt: number;
+    resolvedAt?: number;
+    airingAt: number;
+    airingPrecision?: 'instant' | 'date' | 'unknown';
+  };
   createdAt: number;
   completedAt: number | null;
   syncUpdatedAt?: number;
@@ -184,14 +192,16 @@ export interface WebDavSyncResult {
 
 export interface DesktopApi {
   getState(): Promise<AppState>;
-  fetchSeason(params: { season: Season; year: number }): Promise<Anime[]>;
+  fetchSeason(params: { season: Season; year: number; force?: boolean }): Promise<Anime[]>;
   toggleFollow(anime: Anime): Promise<AppState>;
+  unfollow?(animeId: number): Promise<AppState>;
   updateFollowTitle(animeId: number, displayTitle: string): Promise<AppState>;
   resolveBangumiTitle?(anime: Anime): Promise<BangumiTitleMatch>;
   testBangumiConnection?(baseUrl: string): Promise<ConnectionTestResult>;
   toggleTask(taskId: string): Promise<AppState>;
+  resolveTaskReview?(taskId: string, keepCompleted: boolean): Promise<AppState>;
   updateSettings(settings: Partial<Settings>): Promise<AppState>;
-  syncNow(): Promise<{ created: number; syncedAt: number }>;
+  syncNow(): Promise<{ created: number; syncedAt: number; warning?: string }>;
   getCacheInfo(): Promise<CacheInfo>;
   clearCache(): Promise<CacheInfo>;
   getWebDavConfig(): Promise<WebDavConfig>;

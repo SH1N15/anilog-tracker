@@ -11,10 +11,14 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
 - 正式版：`v0.7.4`，GitHub Latest
-- 当前开发基线：`v0.7.4`
-- 当前维护安排（2026-09-13）：本地与 GitHub 暂时固定为 `v0.7.4`，不继续 API 请求/缓存优化或下一版开发。应用源码保持发布标签 `v0.7.4`（`090593d`）的内容，仅同步维护状态文档；新代码变更、构建或发布需维护者重新明确授权。
+- 当前开发基线：从 `v0.7.4`（`090593d`）修复，当前本地候选版 `v0.7.5-rc.3`。
+- 当前维护安排（2026-09-14）：rc.2 已修正 AniList 查询契约、本季集号匹配和状态初始化；维护者继续反馈未播出集的旧完成记录影响已看计数。rc.3 保留异常记录供核对、隔离计数与自动上传，Android 使用 `versionCode=17`，高于 rc.2 的 code 16；公开正式版、GitHub Latest、既有标签和附件保持不变。本轮不自动提交、推送或发布。
 - Android `versionCode`：`13`（上一正式版 `v0.7.3` 为 `11`，本地验收版 `v0.7.4-rc.1` 为 `12`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
+
+候选版变更契约见 [WATCH_STATE_REGRESSIONS.md](WATCH_STATE_REGRESSIONS.md) 与
+[ANILIST_REQUEST_POLICY.md](ANILIST_REQUEST_POLICY.md)。下面的 v0.7.4 测试数量是
+已发布版本的历史验收基线，不是候选版的新验收结论。
 
 Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capacitor 的回退路径，删除条件和迁移终止版本应另行规划，不能夹带在普通修改中。
 
@@ -28,6 +32,7 @@ Tauri 已成为正式架构。`electron/` 和 `android/` 是 v0.5 Electron/Capac
 | `src-tauri/src/bangumi.rs` | Bangumi API、数据模型、映射和 Token 存储契约 | Standard |
 | `src-tauri/src/mobile.rs` | Rust 到 Android 原生插件的桥接 | 现行 |
 | `src-tauri/src/mobile_state.rs` | 完整原生快照合并、设备日程与任务历史保护 | 现行 |
+| `src-tauri/src/anilist_cache.rs` | AniList 分级缓存、批量请求、去重和持久退避 | 候选版 |
 | `src-tauri/gen/android/` | Tauri Android 工程；AlarmManager、WorkManager、通知、Keystore、WebDAV 传输 | 现行 |
 | `src-tauri/gen/android/app/src/main/java/io/anilog/android/EpisodeSchedule.java` | 可单测的逐集身份、时间精度和任务纠偏 | Standard |
 | `electron/` | v0.5 Windows Electron 实现 | 稳定版回退，保留 |

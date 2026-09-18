@@ -117,14 +117,28 @@ pub(super) fn merge_snapshot(state: &mut Value, status: &Value, now: i64) -> any
         // Only an explicit per-episode future fact may retract a pending task.
         // A stale `next` or a date with no time is not evidence that it is unaired.
         if let Some(schedule) = native["episodeSchedule"].as_array() {
-            state["tasks"].as_array_mut().unwrap().retain(|task| {
-                if value_string(task.get("status")) == "completed"
-                    || (value_i64(task.get("subjectId")) != id
-                        && value_i64(task.get("animeId")) != id)
+            state["tasks"].as_array_mut().unwrap().retain_mut(|task| {
+                if value_i64(task.get("subjectId")) != id
+                    && value_i64(task.get("animeId")) != id
                 {
                     return true;
                 }
                 let number = value_i64(task.get("episode"));
+                if task["status"] == "completed" {
+                    if let Some(row) = schedule.iter().find(|row| value_i64(row.get("episode")) == number) {
+                        if value_i64(row.get("episodeId")) > 0 && value_i64(row.get("airingAt")) > 0 {
+                            task["episodeId"] = row["episodeId"].clone();
+                            task["airingAt"] = row["airingAt"].clone();
+                            task["airingPrecision"] = row["airingPrecision"].clone();
+                            task["airingSource"] = json!("bangumi_episode");
+                            super::watch_history::review_future_completion(task, now);
+                        }
+                    }
+                    return true;
+                }
+                if super::watch_history::is_reset(task) {
+                    return true;
+                }
                 !schedule.iter().any(|row| {
                     let at = value_i64(row.get("airingAt"));
                     value_i64(row.get("episode")) == number
@@ -148,7 +162,7 @@ pub(super) fn merge_snapshot(state: &mut Value, status: &Value, now: i64) -> any
         .into_iter()
         .flatten()
         .filter(|task| {
-            value_string(task.get("status")) == "pending"
+            super::watch_history::is_pending(task, now)
                 && !known.contains(&value_string(task.get("id")))
         })
         .count())

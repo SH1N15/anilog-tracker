@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bell,
+  AlertTriangle,
   BellRing,
   CalendarDays,
   CalendarRange,
@@ -37,13 +38,15 @@ import {
   Trash2,
   User,
   Users,
+  Undo2,
   X,
 } from 'lucide-react';
 import { api } from './api';
 import type { Anime, AppState, BangumiAuthStatus, BangumiCollectionStatus, BangumiConflictPolicy, BangumiFinaleCompletedPayload, BangumiMappingResolution, BangumiSubjectExtras, BangumiSyncReport, BangumiSyncSettingsPatch, BangumiTitleMatch, BangumiUserProfile, FollowedAnime, Season, SeasonViewMode, Settings as AppSettings, UiLanguage, ViewId, WatchTask, WebDavConfig } from './types';
 import { IS_ORIGINAL_EDITION, productName, titleForPreference } from './edition';
 import { localizeMessage, normalizeUiLanguage, tr } from './i18n';
-import { createStateRefreshController } from './state-refresh';
+import { createStateRefreshController, type StateRefreshController } from './state-refresh';
+import { isCompletedHistory, isPendingHistory, isScheduledHistoryReset, needsHistoryReview } from './task-history';
 import { IS_TAURI_APP } from './platform/tauri';
 import {
   currentSeason,
@@ -151,6 +154,9 @@ function App() {
   const initialUi = useMemo(() => loadUiState(nowSeason), [nowSeason.season, nowSeason.year]);
   const [view, setView] = useState<ViewId>(initialUi.view);
   const [state, setState] = useState<AppState>(EMPTY_STATE);
+  const [stateReady, setStateReady] = useState(false);
+  const [stateLoadError, setStateLoadError] = useState('');
+  const stateRefresh = useRef<StateRefreshController | null>(null);
   const [season, setSeason] = useState<Season>(initialUi.season);
   const [year, setYear] = useState(initialUi.year);
   const [seasonView, setSeasonView] = useState<SeasonViewMode>(initialUi.seasonView);
@@ -209,11 +215,18 @@ function App() {
     const controller = createStateRefreshController({
       getState: api.getState,
       subscribe: api.onStateChanged,
-      applyState: setState,
+      applyState: (nextState) => {
+        setState(nextState);
+        setStateReady(true);
+        setStateLoadError('');
+      },
       onError: (reason) => {
-        setError(reason instanceof Error ? localizeMessage(reason.message, language) : t('无法读取本地状态', 'Could not read local data'));
+        const message = reason instanceof Error ? localizeMessage(reason.message, language) : t('无法读取本地状态', 'Could not read local data');
+        setStateLoadError(message);
+        setError(message);
       },
     });
+    stateRefresh.current = controller;
 
     const refreshWhenVisible = () => {
       if (document.visibilityState === 'visible') void controller.refresh();
@@ -225,6 +238,7 @@ function App() {
     window.addEventListener('focus', refreshWhenFocused);
     return () => {
       controller.dispose();
+      if (stateRefresh.current === controller) stateRefresh.current = null;
       document.removeEventListener('visibilitychange', refreshWhenVisible);
       window.removeEventListener('focus', refreshWhenFocused);
     };
@@ -234,13 +248,13 @@ function App() {
     localStorage.setItem(UI_STATE_KEY, JSON.stringify({ view, season, year, seasonView }));
   }, [view, season, year, seasonView]);
 
-  const loadSeason = useCallback(async () => {
+  const loadSeason = useCallback(async (force = false) => {
     const requestId = ++seasonRequest.current;
     setLoading(true);
     setSeasonStale(false);
     setError('');
     try {
-      const nextAnime = await api.fetchSeason({ season, year });
+      const nextAnime = await api.fetchSeason({ season, year, force });
       if (requestId === seasonRequest.current) setAnime(nextAnime);
     } catch (reason) {
       if (requestId === seasonRequest.current) setError(reason instanceof Error ? localizeMessage(reason.message, language) : t('无法读取本季番剧', 'Could not load this season'));
@@ -250,8 +264,8 @@ function App() {
   }, [season, year, language]);
 
   useEffect(() => {
-    void loadSeason();
-  }, [loadSeason]);
+    if (stateReady && view === 'season') void loadSeason();
+  }, [loadSeason, view, stateReady]);
 
   useEffect(() => api.onSeasonUpdated((update) => {
     if (update.season === season && update.year === year) {
@@ -266,9 +280,18 @@ function App() {
     setSyncing(true);
     setLastSyncMessage('');
     try {
+      if (IS_TAURI_APP && !IS_ORIGINAL_EDITION && state.bangumiSyncSettings?.syncEnabled && api.bangumiSyncNow) {
+        const result = await api.bangumiSyncNow();
+        setState(await api.getState());
+        setLastSyncMessage(localizeMessage(result.message, language));
+        if (view === 'season') await loadSeason(true);
+        return;
+      }
       const result = await api.syncNow();
       setState(await api.getState());
-      setLastSyncMessage(result.created ? t(`新增 ${result.created} 个观看任务`, `${result.created} watch task${result.created === 1 ? '' : 's'} added`) : t('已是最新状态', 'Already up to date'));
+      setLastSyncMessage(result.warning ? localizeMessage(result.warning, language)
+        : result.created ? t(`新增 ${result.created} 个观看任务`, `${result.created} watch task${result.created === 1 ? '' : 's'} added`) : t('已是最新状态', 'Already up to date'));
+      if (view === 'season') await loadSeason(true);
     } catch (reason) {
       setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('同步失败', 'Sync failed'));
     } finally {
@@ -315,8 +338,28 @@ function App() {
     return keys;
   }, [state.following]);
 
-  const pendingCount = state.tasks.filter((task) => task.status === 'pending').length;
+  const pendingCount = state.tasks.filter(isPendingHistory).length;
   const isAndroid = state.runtime?.platform === 'android';
+
+  if (!stateReady) {
+    return (
+      <main className="app-bootstrap" role={stateLoadError ? 'alert' : 'status'} aria-busy={!stateLoadError}>
+        <strong>AniLog</strong>
+        {stateLoadError ? (
+          <>
+            <p>{t('无法读取本地数据', 'Could not read local data')}</p>
+            <span>{stateLoadError}</span>
+            <button className="icon-button" title={t('重试', 'Retry')} aria-label={t('重试', 'Retry')} onClick={() => {
+              setStateLoadError('');
+              void stateRefresh.current?.refresh(true);
+            }}><RefreshCw size={20} /></button>
+          </>
+        ) : (
+          <p><LoaderCircle className="spin" size={20} />{t('正在读取本地数据', 'Loading local data')}</p>
+        )}
+      </main>
+    );
+  }
 
   return (
     <div className={`app-shell ${isAndroid ? 'android-app' : ''}`}>
@@ -376,6 +419,7 @@ function App() {
         </header>
 
         <div className="view-container">
+          {lastSyncMessage && <p className="mobile-sync-message" role="status">{lastSyncMessage}</p>}
           {finaleBanner && (
             <div className="finale-banner" role="status">
               <div className="finale-copy">
@@ -412,11 +456,20 @@ function App() {
               onSeasonChange={setSeason}
               onYearChange={setYear}
               onSeasonViewChange={setSeasonView}
-              onRetry={loadSeason}
+              onRetry={() => void loadSeason(true)}
               onToggleFollow={toggleFollowAnime}
             />
           )}
-          {view === 'tasks' && <TasksView tasks={state.tasks} language={language} onToggle={async (id) => setState(await api.toggleTask(id))} />}
+          {view === 'tasks' && <TasksView tasks={state.tasks} language={language}
+            onToggle={async (id) => setState(await api.toggleTask(id))}
+            onResolveReview={api.resolveTaskReview ? async (id, keep) => {
+              try {
+                setState(await api.resolveTaskReview!(id, keep));
+                setLastSyncMessage(keep ? t('已确认观看记录', 'Watch record confirmed') : t('已撤销完成，原记录已留存', 'Completion reset; original record retained'));
+              } catch (reason) {
+                setLastSyncMessage(reason instanceof Error ? localizeMessage(reason.message, language) : t('核对失败', 'Review failed'));
+              }
+            } : undefined} />}
           {view === 'following' && (
             <FollowingView
               items={state.following}
@@ -434,7 +487,8 @@ function App() {
                 if (!window.confirm(t(`确认取消追番《${followed.displayTitle}》吗？\n\n${taskNotice}`, `Unfollow “${followed.displayTitle}”?\n\n${taskNotice}`))) return;
                 // 问题 2：失败也要落到顶栏消息（未处理 rejection 会让卡片停留在陈旧状态）。
                 try {
-                  if (source) setState(await api.toggleFollow(source));
+                  if (api.unfollow) setState(await api.unfollow(id));
+                  else if (source) setState(await api.toggleFollow(source));
                   // Bangumi 条目可能不在当前季度列表里；fabricate 的对象需带全标识字段（id 可为 subjectId）。
                   else setState(await api.toggleFollow({
                     ...followed,
@@ -938,25 +992,31 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
   );
 }
 
-function TasksView({ tasks, language, onToggle }: { tasks: WatchTask[]; language: UiLanguage; onToggle: (id: string) => Promise<void> }) {
+function TasksView({ tasks, language, onToggle, onResolveReview }: {
+  tasks: WatchTask[]; language: UiLanguage; onToggle: (id: string) => Promise<void>;
+  onResolveReview?: (id: string, keepCompleted: boolean) => Promise<void>;
+}) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
-  const [filter, setFilter] = useState<'pending' | 'completed' | 'all'>('pending');
-  const visible = tasks.filter((task) => filter === 'all' || task.status === filter);
-  const pending = tasks.filter((task) => task.status === 'pending').length;
-  const completed = tasks.filter((task) => task.status === 'completed').length;
+  const [filter, setFilter] = useState<'pending' | 'completed' | 'review' | 'all'>('pending');
+  const reviews = tasks.filter(needsHistoryReview).length;
+  const visible = tasks.filter((task) => filter === 'all' || (filter === 'review' ? needsHistoryReview(task)
+    : filter === 'completed' ? isCompletedHistory(task) : isPendingHistory(task)));
+  const pending = tasks.filter(isPendingHistory).length;
+  const completed = tasks.filter(isCompletedHistory).length;
 
   return (
     <>
       <section className="task-summary">
         <div><span>{t('待观看', 'To watch')}</span><strong>{pending}</strong><small>{t('播出后自动加入', 'Added after airing')}</small></div>
         <div><span>{t('已看完', 'Completed')}</span><strong>{completed}</strong><small>{t('保留观看记录', 'Watch history kept')}</small></div>
-        <div><span>{t('完成率', 'Completion')}</span><strong>{tasks.length ? Math.round((completed / tasks.length) * 100) : 0}%</strong><small>{t('当前任务清单', 'Current task list')}</small></div>
+        <div><span>{t('完成率', 'Completion')}</span><strong>{pending + completed ? Math.round((completed / (pending + completed)) * 100) : 0}%</strong><small>{t('当前任务清单', 'Current task list')}</small></div>
       </section>
       <section className="section-heading compact">
         <div><div className="eyebrow"><ListChecks size={14} /> {t('每集任务', 'Episode tasks')}</div><h2>{t('观看清单', 'Watch list')}</h2><p>{t('勾选一集，任务即归档到已完成。', 'Check off an episode to archive it as completed.')}</p></div>
         <div className="segmented-control task-tabs">
           <button className={filter === 'pending' ? 'selected' : ''} onClick={() => setFilter('pending')}>{t('待看', 'Pending')} {pending}</button>
           <button className={filter === 'completed' ? 'selected' : ''} onClick={() => setFilter('completed')}>{t('已看', 'Completed')} {completed}</button>
+          {(reviews > 0 || filter === 'review') && <button className={filter === 'review' ? 'selected' : ''} onClick={() => setFilter('review')}>{t('待核对', 'Review')} {reviews}</button>}
           <button className={filter === 'all' ? 'selected' : ''} onClick={() => setFilter('all')}>{t('全部', 'All')}</button>
         </div>
       </section>
@@ -964,24 +1024,50 @@ function TasksView({ tasks, language, onToggle }: { tasks: WatchTask[]; language
         <EmptyState icon={CheckCircle2} title={filter === 'pending' ? t('待看清单已清空', 'No pending tasks') : t('这里还没有观看记录', 'No watch history yet')} body={filter === 'pending' ? t('追番更新后，每集会自动出现在这里。', 'New episodes will appear here after they air.') : t('看完一集并勾选后会保存在这里。', 'Completed episodes will be kept here.')} />
       ) : (
         <div className="task-list">
-          {visible.map((task) => <TaskRow key={task.id} task={task} language={language} onToggle={() => onToggle(task.id)} />)}
+          {visible.map((task) => <TaskRow key={task.id} task={task} language={language}
+            onToggle={() => onToggle(task.id)}
+            onResolveReview={onResolveReview ? (keep) => onResolveReview(task.id, keep) : undefined} />)}
         </div>
       )}
     </>
   );
 }
 
-function TaskRow({ task, language, onToggle }: { task: WatchTask; language: UiLanguage; onToggle: () => void }) {
+function TaskRow({ task, language, onToggle, onResolveReview }: {
+  task: WatchTask; language: UiLanguage; onToggle: () => void;
+  onResolveReview?: (keepCompleted: boolean) => Promise<void>;
+}) {
   const t = (chinese: string, english: string) => tr(language, chinese, english);
+  const review = needsHistoryReview(task);
+  const scheduled = isScheduledHistoryReset(task);
+  const completed = isCompletedHistory(task);
+  const [busy, setBusy] = useState(false);
+  const resolve = async (keep: boolean) => {
+    if (!onResolveReview || busy) return;
+    const message = keep
+      ? t('确认确实已看完这集？确认后计入进度，启用观看进度同步时会写回账户。', 'Confirm that you watched this episode? It will count toward progress and sync when progress upload is enabled.')
+      : t('撤销这条完成记录？原记录留存，实际播出后进入待看；启用进度同步时会撤销账户中对应集的已看状态。', 'Reset this completion? The original record is retained and the episode becomes pending after airing. Its watched status will be reset when progress upload is enabled.');
+    if (!window.confirm(message)) return;
+    setBusy(true);
+    try { await onResolveReview(keep); } finally { setBusy(false); }
+  };
   return (
-    <article className={`task-row ${task.status === 'completed' ? 'completed' : ''}`}>
-      <button className="task-check" title={task.status === 'completed' ? t('恢复为待看', 'Restore as pending') : t('标记为已看', 'Mark as watched')} onClick={onToggle}>
-        {task.status === 'completed' ? <CheckCircle2 size={23} /> : <Circle size={23} />}
+    <article className={`task-row ${completed ? 'completed' : ''} ${review ? 'history-review' : ''}`}>
+      <button className="task-check" disabled={review || scheduled || busy}
+        title={review ? t('完成记录待核对', 'Completion needs review') : scheduled ? t('尚未播出', 'Not aired yet') : completed ? t('恢复为待看', 'Restore as pending') : t('标记为已看', 'Mark as watched')} onClick={onToggle}>
+        {review ? <AlertTriangle size={23} /> : scheduled ? <Clock3 size={23} /> : completed ? <CheckCircle2 size={23} /> : <Circle size={23} />}
       </button>
       {task.coverImage ? <img src={task.coverImage} alt="" /> : <span className="cover-placeholder" />}
-      <div className="task-copy"><strong>{task.animeTitle}</strong><span>{t(`第 ${task.episode} 集`, `Episode ${task.episode}`)}</span></div>
+      <div className="task-copy"><strong>{task.animeTitle}</strong><span>{t(`第 ${task.episode} 集`, `Episode ${task.episode}`)}</span>
+        {review && <small>{t('完成记录早于播出，未计入进度', 'Completion predates airing; excluded from progress')}</small>}
+      </div>
       <div className="task-time"><Clock3 size={15} /><span>{formatAiring(task.airingAt, true, language, task.airingPrecision)}</span></div>
-      <span className="task-state">{task.status === 'completed' ? t('已看完', 'Completed') : t('待观看', 'To watch')}</span>
+      {review && onResolveReview ? (
+        <div className="history-review-actions">
+          <button className="icon-button" disabled={busy} title={t('确认已看', 'Confirm watched')} aria-label={t('确认已看', 'Confirm watched')} onClick={() => void resolve(true)}><Check size={17} /></button>
+          <button className="icon-button" disabled={busy} title={t('撤销异常完成', 'Reset completion')} aria-label={t('撤销异常完成', 'Reset completion')} onClick={() => void resolve(false)}><Undo2 size={17} /></button>
+        </div>
+      ) : <span className="task-state">{review ? t('待核对', 'Needs review') : scheduled ? t('未播出', 'Unaired') : completed ? t('已看完', 'Completed') : t('待观看', 'To watch')}</span>}
     </article>
   );
 }
@@ -1740,7 +1826,7 @@ function SettingsView({ state, language, onChange, onApplyState }: { state: AppS
                     aria-label="冲突策略"
                     onChange={(event) => void updateBangumiSyncSettings({ conflictPolicy: event.target.value as BangumiConflictPolicy })}
                   >
-                    <option value="latest">按更新时间</option>
+                    <option value="latest">自动（保留本地修改）</option>
                     <option value="local-first">本地优先</option>
                     <option value="bangumi-first">Bangumi 优先</option>
                   </select>
