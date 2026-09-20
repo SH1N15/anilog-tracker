@@ -1,6 +1,6 @@
 # AniList Request Policy
 
-This policy applies to the Tauri v0.7.5-rc.2 candidate. Electron and Capacitor
+This policy applies to the Tauri v0.7.5 release. Electron and Capacitor
 fallback implementations keep their existing caches.
 
 ## Refresh Classes
@@ -54,6 +54,13 @@ Cached catalogs appear immediately; expired entries refresh in the background.
   raw response bodies.
 - A failed supplement is surfaced as a warning, including in full Bangumi
   sync. Keeping stale data is not equivalent to a successful refresh.
+- Each Tauri network operation builds a `reqwest` client with `system-proxy`
+  enabled even though default features stay disabled. reqwest snapshots the
+  operating system proxy when a client is built, so the client is deliberately
+  not cached for the process lifetime. Windows and macOS builds therefore honor
+  the current system proxy for Bangumi, AniList, and WebDAV requests after a
+  VPN/proxy switch; do not replace this with `no_proxy()` or a hard-coded proxy
+  address.
 
 ## Android Bridge
 

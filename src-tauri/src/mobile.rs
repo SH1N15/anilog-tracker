@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
@@ -12,11 +13,18 @@ use super::{
 const PLUGIN_IDENTIFIER: &str = "io.anilog.android";
 
 #[derive(Clone)]
-pub struct MobileBridge(PluginHandle<Wry>);
+pub struct MobileBridge {
+    handle: PluginHandle<Wry>,
+    call_lock: Arc<Mutex<()>>,
+}
 
 impl MobileBridge {
     fn run(&self, command: &str, payload: Value) -> anyhow::Result<Value> {
-        self.0
+        let _guard = self
+            .call_lock
+            .lock()
+            .map_err(|_| anyhow!("Android 原生桥接锁不可用"))?;
+        self.handle
             .run_mobile_plugin(command, payload)
             .map_err(|error| anyhow!(error.to_string()))
     }
@@ -26,7 +34,10 @@ pub fn init() -> TauriPlugin<Wry, ()> {
     Builder::<Wry, ()>::new("anilog-mobile")
         .setup(|app, api| {
             let handle = api.register_android_plugin(PLUGIN_IDENTIFIER, "AniLogPlugin")?;
-            app.manage(MobileBridge(handle));
+            app.manage(MobileBridge {
+                handle,
+                call_lock: Arc::new(Mutex::new(())),
+            });
             Ok(())
         })
         .build()
@@ -34,18 +45,23 @@ pub fn init() -> TauriPlugin<Wry, ()> {
 
 fn configuration_payload(context: &AppContext) -> anyhow::Result<Value> {
     let state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
-    let mut payload = super::mobile_state::configuration_payload(
-        &state,
-        context.original,
-    );
-    let cached: Vec<Value> = super::anilist_cache::following_requests(&state, context.original, 21600)
-        .keys().filter_map(|&id| {
-            let snapshot = super::anilist_cache::read_snapshot(&context.cache_dir.join("anilist-cache"), id)?;
-            if !snapshot.precise(now_seconds()) { return None; }
-            let mut media = snapshot.media;
-            media["_fetchedAt"] = json!(snapshot.fetched_at);
-            Some(media)
-        }).collect();
+    let mut payload = super::mobile_state::configuration_payload(&state, context.original);
+    let cached: Vec<Value> =
+        super::anilist_cache::following_requests(&state, context.original, 21600)
+            .keys()
+            .filter_map(|&id| {
+                let snapshot = super::anilist_cache::read_snapshot(
+                    &context.cache_dir.join("anilist-cache"),
+                    id,
+                )?;
+                if !snapshot.precise(now_seconds()) {
+                    return None;
+                }
+                let mut media = snapshot.media;
+                media["_fetchedAt"] = json!(snapshot.fetched_at);
+                Some(media)
+            })
+            .collect();
     payload["anilistCache"] = json!(cached);
     Ok(payload)
 }
@@ -69,12 +85,11 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
     let mut state = context.state.lock().map_err(|_| anyhow!("状态锁不可用"))?;
     let before = serde_json::to_string(&*state)?;
     let created = super::mobile_state::merge_snapshot(&mut state, status, now_seconds())?;
-    state["tasks"]
-        .as_array_mut()
-        .unwrap()
-        .sort_by(|left, right| {
+    if let Some(tasks) = state["tasks"].as_array_mut() {
+        tasks.sort_by(|left, right| {
             value_i64(right.get("airingAt")).cmp(&value_i64(left.get("airingAt")))
         });
+    }
     let changed = before != serde_json::to_string(&*state)?;
     let allowed = super::anilist_cache::following_requests(&state, context.original, 21600);
     drop(state);
@@ -83,10 +98,17 @@ fn merge_status(app: &AppHandle, context: &AppContext, status: &Value) -> anyhow
         let at = value_i64(media.get("_fetchedAt"));
         if allowed.contains_key(&id) && at > 0 && at <= now_seconds() {
             let mut media = media.clone();
-            media.as_object_mut().unwrap().remove("_fetchedAt");
+            let Some(object) = media.as_object_mut() else {
+                continue;
+            };
+            object.remove("_fetchedAt");
             let _ = super::anilist_cache::store_snapshot(
-                &context.cache_dir.join("anilist-cache"), id,
-                &super::anilist_cache::Snapshot { fetched_at: at, media },
+                &context.cache_dir.join("anilist-cache"),
+                id,
+                &super::anilist_cache::Snapshot {
+                    fetched_at: at,
+                    media,
+                },
             );
         }
     }
@@ -218,9 +240,16 @@ pub fn import_legacy_state(app: &AppHandle, context: &AppContext) -> anyhow::Res
     Ok(true)
 }
 
-pub fn sync_native_with_policy(app: &AppHandle, context: &AppContext, force: bool, target: i64) -> anyhow::Result<Value> {
+pub fn sync_native_with_policy(
+    app: &AppHandle,
+    context: &AppContext,
+    force: bool,
+    target: i64,
+) -> anyhow::Result<Value> {
     configure(app, context)?;
-    let mut status = app.state::<MobileBridge>().run("syncNow", json!({"force": force, "target": target}))?;
+    let mut status = app
+        .state::<MobileBridge>()
+        .run("syncNow", json!({"force": force, "target": target}))?;
     let created = merge_status(app, context, &status)?;
     status["created"] = json!(created);
     configure(app, context)?;

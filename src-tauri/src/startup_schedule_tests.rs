@@ -35,7 +35,6 @@ impl TestContext {
             runtime: Arc::new(Mutex::new(json!({"platform": "android"}))),
             data_dir: directory.clone(),
             cache_dir: directory.join("season-cache"),
-            client: reqwest::Client::new(),
             original: cfg!(feature = "original"),
             sync_wakeup: Arc::new(tokio::sync::Notify::new()),
             webdav_wakeup: Arc::new(tokio::sync::Notify::new()),

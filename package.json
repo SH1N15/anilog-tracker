@@ -1,6 +1,6 @@
 {
   "name": "anilog",
-  "version": "0.7.5-rc.4",
+  "version": "0.7.5",
   "private": true,
   "description": "A local-first Windows and Android anime schedule, notification, and episode task tracker powered by AniList.",
   "author": "SH1N15",
@@ -40,6 +40,8 @@
     "android:apk": "npm run android:sync && cd android && gradlew.bat assembleStandardDebug",
     "android:apk:original": "npm run android:sync:original && cd android && gradlew.bat assembleOriginalDebug",
     "test:bangumi": "node scripts/test-bangumi.cjs",
+    "test:network-client": "node scripts/test-network-client-contract.cjs",
+    "test:android-startup": "node scripts/test-android-startup-contract.cjs",
     "test:data": "node scripts/test-data-path.cjs",
     "test:season-cache": "node scripts/test-season-cache.cjs",
     "test:season-grouping": "node scripts/test-season-grouping.cjs",

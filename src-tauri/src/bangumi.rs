@@ -1065,10 +1065,7 @@ pub fn update_collection_url(base: &BangumiBaseUrls, subject_id: i64) -> String 
 /// `PUT {v0}/users/-/collections/-/episodes/{episode_id}`，body `{"type": N}`。
 /// `-` 占位 = 当前 token 用户（官方 spec）。
 pub fn episode_progress_url(base: &BangumiBaseUrls, episode_id: i64) -> String {
-    format!(
-        "{}/users/-/collections/-/episodes/{episode_id}",
-        base.v0
-    )
+    format!("{}/users/-/collections/-/episodes/{episode_id}", base.v0)
 }
 
 /// `PATCH {v0}/users/-/collections/{subject_id}/episodes`，
@@ -1122,11 +1119,22 @@ pub enum BangumiApiError {
 impl fmt::Display for BangumiApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BangumiApiError::Unauthorized { message } => write!(f, "Bangumi 认证失败（401）：{message}"),
-            BangumiApiError::Forbidden { message } => write!(f, "Bangumi 拒绝访问（403）：{message}"),
-            BangumiApiError::NotFound { message } => write!(f, "Bangumi 资源不存在（404）：{message}"),
-            BangumiApiError::Conflict { message } => write!(f, "Bangumi 状态冲突（409）：{message}"),
-            BangumiApiError::RateLimited { retry_after, message } => match retry_after {
+            BangumiApiError::Unauthorized { message } => {
+                write!(f, "Bangumi 认证失败（401）：{message}")
+            }
+            BangumiApiError::Forbidden { message } => {
+                write!(f, "Bangumi 拒绝访问（403）：{message}")
+            }
+            BangumiApiError::NotFound { message } => {
+                write!(f, "Bangumi 资源不存在（404）：{message}")
+            }
+            BangumiApiError::Conflict { message } => {
+                write!(f, "Bangumi 状态冲突（409）：{message}")
+            }
+            BangumiApiError::RateLimited {
+                retry_after,
+                message,
+            } => match retry_after {
                 Some(duration) => write!(
                     f,
                     "Bangumi 请求过于频繁（429），{} 秒后重试：{message}",
@@ -1245,7 +1253,8 @@ pub fn next_broadcast_after(
     preferred: &[String],
     after: DateTime<impl TimeZone>,
 ) -> Option<DateTime<Utc>> {
-    let (selected_begin, selected_broadcast) = select_broadcast_source(begin, broadcast, sites, preferred);
+    let (selected_begin, selected_broadcast) =
+        select_broadcast_source(begin, broadcast, sites, preferred);
     if let Some(rule) = selected_broadcast {
         if let Some(occurrence) = next_recurrence(rule, &after) {
             return Some(occurrence);
@@ -1318,7 +1327,9 @@ pub(crate) fn parse_instant(value: &str) -> Option<DateTime<Utc>> {
 /// `HttpBangumiClient`，测试用 [`FixtureBangumiClient`]）。不追求 dyn 兼容。
 pub trait BangumiClient {
     /// `GET {root}/calendar`（根路径）。
-    fn get_calendar(&self) -> impl Future<Output = Result<Vec<BangumiCalendarDay>, BangumiApiError>>;
+    fn get_calendar(
+        &self,
+    ) -> impl Future<Output = Result<Vec<BangumiCalendarDay>, BangumiApiError>>;
     /// `GET {v0}/subjects?type=2&year=&month=&limit=&offset=`（季度列表分页）。
     fn get_season_subjects(
         &self,
@@ -1350,7 +1361,8 @@ pub trait BangumiClient {
         subject_id: i64,
     ) -> impl Future<Output = Result<Vec<BangumiRelatedSubject>, BangumiApiError>>;
     /// `GET {v0}/me`。
-    fn get_user_profile(&self) -> impl Future<Output = Result<BangumiUserProfile, BangumiApiError>>;
+    fn get_user_profile(&self)
+    -> impl Future<Output = Result<BangumiUserProfile, BangumiApiError>>;
     /// `GET {v0}/users/{username}/collections?subject_type=&limit=&offset=`。
     fn get_user_collections(
         &self,
@@ -1439,7 +1451,10 @@ impl BangumiClient for FixtureBangumiClient {
         )))
     }
 
-    async fn get_subject_detail(&self, _subject_id: i64) -> Result<BangumiSubject, BangumiApiError> {
+    async fn get_subject_detail(
+        &self,
+        _subject_id: i64,
+    ) -> Result<BangumiSubject, BangumiApiError> {
         Ok(Self::parse(include_str!(
             "../fixtures/bangumi/subject-detail.json"
         )))
@@ -1502,7 +1517,11 @@ impl BangumiClient for FixtureBangumiClient {
         )))
     }
 
-    async fn update_collection(&self, _subject_id: i64, _payload: &Value) -> Result<(), BangumiApiError> {
+    async fn update_collection(
+        &self,
+        _subject_id: i64,
+        _payload: &Value,
+    ) -> Result<(), BangumiApiError> {
         Ok(())
     }
 
@@ -1589,10 +1608,14 @@ impl HttpBangumiClient {
     /// 自带 reqwest Client 的构造：UA `AniLog Tauri/<CARGO_PKG_VERSION>`，
     /// 整体超时 15s（与 lib.rs 主客户端一致，防止无超时挂起）。
     pub fn with_base(base: BangumiBaseUrls) -> reqwest::Result<Self> {
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .user_agent(concat!("AniLog Tauri/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
+            .timeout(std::time::Duration::from_secs(15));
+        // Unit-test mock servers must not be redirected through a developer's
+        // system proxy; the production AppContext client keeps proxy discovery.
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        let client = builder.build()?;
         Ok(Self::new(client, base))
     }
 
@@ -1703,11 +1726,10 @@ impl HttpBangumiClient {
         match primary_error {
             BangumiApiError::Network(_)
             | BangumiApiError::Timeout
-            | BangumiApiError::ServerError(_) => {
-                self.get_calendar_from(&calendar_url(&self.fallback))
-                    .await
-                    .map_err(|_fallback_error| primary_error)
-            }
+            | BangumiApiError::ServerError(_) => self
+                .get_calendar_from(&calendar_url(&self.fallback))
+                .await
+                .map_err(|_fallback_error| primary_error),
             other => Err(other),
         }
     }
@@ -1832,7 +1854,8 @@ impl HttpBangumiClient {
     ) -> Result<(), BangumiApiError> {
         let url = episode_progress_url(&self.base, episode_id);
         let body = serde_json::json!({"type": collection_type.as_u32()});
-        self.send_unit(reqwest::Method::PUT, &url, token, &body).await
+        self.send_unit(reqwest::Method::PUT, &url, token, &body)
+            .await
     }
 
     /// `PATCH {v0}/users/-/collections/{subject_id}/episodes`，
@@ -1861,7 +1884,11 @@ impl HttpBangumiClient {
 
 /// reqwest 错误 → [`BangumiApiError`]。信息只含方法与 URL 路径（不含 query），
 /// 绝不包含 Authorization 头或 Token。
-fn map_request_error(method: &reqwest::Method, url: &str, error: reqwest::Error) -> BangumiApiError {
+fn map_request_error(
+    method: &reqwest::Method,
+    url: &str,
+    error: reqwest::Error,
+) -> BangumiApiError {
     if error.is_timeout() {
         return BangumiApiError::Timeout;
     }
@@ -1898,10 +1925,7 @@ impl BangumiClient for TokenBoundBangumiClient<'_> {
             .await
     }
 
-    async fn get_subject_detail(
-        &self,
-        subject_id: i64,
-    ) -> Result<BangumiSubject, BangumiApiError> {
+    async fn get_subject_detail(&self, subject_id: i64) -> Result<BangumiSubject, BangumiApiError> {
         self.client.get_subject_detail(subject_id).await
     }
 
@@ -1911,7 +1935,9 @@ impl BangumiClient for TokenBoundBangumiClient<'_> {
         limit: u32,
         offset: u32,
     ) -> Result<Paged<BangumiEpisode>, BangumiApiError> {
-        self.client.get_subject_episodes(subject_id, limit, offset).await
+        self.client
+            .get_subject_episodes(subject_id, limit, offset)
+            .await
     }
 
     async fn get_subject_characters(
@@ -2145,19 +2171,22 @@ fn mapping_candidate_from(subject: &Value, score: i64) -> MappingCandidate {
 }
 
 /// 评分裁决：对候选池打分排序，按阈值/分差/format 规则决定 Mapped 或 Candidates。
-fn mapping_decide_by_score(anime: &Value, pool: &[Value], method: MappingMethod) -> MappingResolution {
+fn mapping_decide_by_score(
+    anime: &Value,
+    pool: &[Value],
+    method: MappingMethod,
+) -> MappingResolution {
     if pool.is_empty() {
         return MappingResolution::None;
     }
-    let mut ranked: Vec<(i64, &Value)> =
-        pool.iter().map(|subject| (mapping_score_subject(anime, subject), subject)).collect();
+    let mut ranked: Vec<(i64, &Value)> = pool
+        .iter()
+        .map(|subject| (mapping_score_subject(anime, subject), subject))
+        .collect();
     ranked.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| {
-                crate::value_i64(left.1.get("b")).cmp(&crate::value_i64(right.1.get("b")))
-            })
+        right.0.cmp(&left.0).then_with(|| {
+            crate::value_i64(left.1.get("b")).cmp(&crate::value_i64(right.1.get("b")))
+        })
     });
     let candidates: Vec<MappingCandidate> = ranked
         .iter()
@@ -2351,7 +2380,11 @@ pub(crate) mod test_support {
         }
     }
 
-    fn handle_connection(stream: std::net::TcpStream, handler: &MockHandler, captured: &Mutex<Vec<RequestRecord>>) {
+    fn handle_connection(
+        stream: std::net::TcpStream,
+        handler: &MockHandler,
+        captured: &Mutex<Vec<RequestRecord>>,
+    ) {
         let mut reader = BufReader::new(match stream.try_clone() {
             Ok(reader) => reader,
             Err(_) => return,
@@ -2424,6 +2457,10 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
     use serde_json::json;
 
     /// 无 tokio rt/macros 依赖的极简 block_on：本模块的 future 均为立即就绪，
@@ -2564,7 +2601,10 @@ mod tests {
             avatar_url: Some("https://lain.bgm.tv/pic/user/m/000/87/65/876543.jpg".into()),
         };
         let value = serde_json::to_value(&user).unwrap();
-        assert_eq!(value["avatarUrl"], "https://lain.bgm.tv/pic/user/m/000/87/65/876543.jpg");
+        assert_eq!(
+            value["avatarUrl"],
+            "https://lain.bgm.tv/pic/user/m/000/87/65/876543.jpg"
+        );
         let restored: BangumiUserSummary = serde_json::from_value(value).unwrap();
         assert_eq!(restored, user);
     }
@@ -2586,8 +2626,14 @@ mod tests {
         // Phase 2（STATE_VERSION 3）：standard 版为记录补 additive 默认键，
         // 既有业务字段与 id 原样保留。
         assert_eq!(merged["following"][0]["id"], following_before[0]["id"]);
-        assert_eq!(merged["following"][0]["displayTitle"], following_before[0]["displayTitle"]);
-        assert_eq!(merged["following"][0]["followedAt"], following_before[0]["followedAt"]);
+        assert_eq!(
+            merged["following"][0]["displayTitle"],
+            following_before[0]["displayTitle"]
+        );
+        assert_eq!(
+            merged["following"][0]["followedAt"],
+            following_before[0]["followedAt"]
+        );
         assert_eq!(merged["following"][0]["source"], "anilist");
         assert_eq!(merged["following"][0]["mappingPending"], false);
         assert_eq!(merged["tasks"][0]["id"], tasks_before[0]["id"]);
@@ -2610,7 +2656,10 @@ mod tests {
         loaded["bangumi"]["apiBaseUrl"] = json!("https://proxy.example.com/v0");
         loaded["bangumi"]["conflictPolicy"] = json!("local-first");
         let merged = crate::merge_defaults(loaded, false);
-        assert_eq!(merged["bangumi"]["apiBaseUrl"], "https://proxy.example.com/v0");
+        assert_eq!(
+            merged["bangumi"]["apiBaseUrl"],
+            "https://proxy.example.com/v0"
+        );
         assert_eq!(merged["bangumi"]["conflictPolicy"], "local-first");
     }
 
@@ -2645,9 +2694,16 @@ mod tests {
 
     #[test]
     fn from_status_429_parses_retry_after() {
-        let error = from_status(429, include_str!("../fixtures/bangumi/error-429.json"), Some("120"));
+        let error = from_status(
+            429,
+            include_str!("../fixtures/bangumi/error-429.json"),
+            Some("120"),
+        );
         match error {
-            BangumiApiError::RateLimited { retry_after, message } => {
+            BangumiApiError::RateLimited {
+                retry_after,
+                message,
+            } => {
                 assert_eq!(retry_after, Some(StdDuration::from_secs(120)));
                 assert!(message.contains("Too Many Requests"));
             }
@@ -2657,7 +2713,11 @@ mod tests {
 
     #[test]
     fn from_status_maps_statuses_and_error_body() {
-        let error = from_status(401, include_str!("../fixtures/bangumi/error-401.json"), None);
+        let error = from_status(
+            401,
+            include_str!("../fixtures/bangumi/error-401.json"),
+            None,
+        );
         assert!(matches!(error, BangumiApiError::Unauthorized { .. }));
         assert!(error.to_string().contains("Unauthorized"));
 
@@ -2692,7 +2752,10 @@ mod tests {
                 (status == 429).then_some("30"),
             );
             let display = error.to_string();
-            assert!(!display.contains("Bearer"), "display leaks Bearer: {display}");
+            assert!(
+                !display.contains("Bearer"),
+                "display leaks Bearer: {display}"
+            );
             assert!(!display.contains("token"), "display leaks token: {display}");
             assert!(!display.contains("Authorization"));
         }
@@ -2703,8 +2766,14 @@ mod tests {
 
     #[test]
     fn parse_retry_after_supports_seconds_only() {
-        assert_eq!(parse_retry_after(Some(" 120 ")), Some(StdDuration::from_secs(120)));
-        assert_eq!(parse_retry_after(Some("0")), Some(StdDuration::from_secs(0)));
+        assert_eq!(
+            parse_retry_after(Some(" 120 ")),
+            Some(StdDuration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after(Some("0")),
+            Some(StdDuration::from_secs(0))
+        );
         // HTTP-date 形式 Phase 0 简化为 None（见函数注释）。
         assert_eq!(
             parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
@@ -2747,7 +2816,9 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default();
-            let expected = vector["expectedNextLocal"].as_str().expect("expectedNextLocal");
+            let expected = vector["expectedNextLocal"]
+                .as_str()
+                .expect("expectedNextLocal");
 
             let next = next_broadcast_after(
                 vector["begin"].as_str(),
@@ -2761,10 +2832,7 @@ mod tests {
             // 结果须以 nowLocalISO 同样的墙钟时区偏移表达。
             let rendered = next.with_timezone(after.offset());
             let actual = rendered.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-            assert_eq!(
-                actual, expected,
-                "vector {name}: broadcast mismatch"
-            );
+            assert_eq!(actual, expected, "vector {name}: broadcast mismatch");
         }
     }
 
@@ -2801,14 +2869,16 @@ mod tests {
         );
         assert_eq!(next.unwrap().to_rfc3339(), "2026-09-12T10:30:00+00:00");
         // begin-only：已过期 → None。
-        assert!(next_broadcast_after(
-            Some("2026-09-12T10:30:00Z"),
-            None,
-            empty,
-            &[],
-            DateTime::parse_from_rfc3339("2026-09-13T00:00:00+08:00").unwrap(),
-        )
-        .is_none());
+        assert!(
+            next_broadcast_after(
+                Some("2026-09-12T10:30:00Z"),
+                None,
+                empty,
+                &[],
+                DateTime::parse_from_rfc3339("2026-09-13T00:00:00+08:00").unwrap(),
+            )
+            .is_none()
+        );
 
         // 周期支持 W（两周）。
         let next = next_broadcast_after(
@@ -2854,7 +2924,10 @@ mod tests {
         assert_eq!(season.data.len(), 2);
         assert_eq!(season.data[0].id, 45678);
         assert_eq!(season.data[0].eps, Some(16));
-        assert_eq!(season.data[0].rating.as_ref().and_then(|r| r.score), Some(8.2));
+        assert_eq!(
+            season.data[0].rating.as_ref().and_then(|r| r.score),
+            Some(8.2)
+        );
 
         // 集数：3 条，type 0/1/0。
         let episodes = block_on(client.get_subject_episodes(45678, 100, 0)).unwrap();
@@ -2864,8 +2937,7 @@ mod tests {
         assert_eq!(episodes.data[0].sort, Some(4.0));
 
         // 收藏：2 条；type 语义 3=Doing / 5=Dropped。
-        let collections =
-            block_on(client.get_user_collections("anilog_dev", 2, 30, 0)).unwrap();
+        let collections = block_on(client.get_user_collections("anilog_dev", 2, 30, 0)).unwrap();
         assert_eq!(collections.data.len(), 2);
         assert_eq!(
             collections.data[0].collection_type,
@@ -2881,8 +2953,7 @@ mod tests {
         );
 
         // 单条收藏 / 详情 / 角色 / 关联 / 用户。
-        let collection =
-            block_on(client.get_user_collection("anilog_dev", 45678)).unwrap();
+        let collection = block_on(client.get_user_collection("anilog_dev", 45678)).unwrap();
         assert_eq!(collection.subject_id, 45678);
         assert_eq!(collection.ep_status, Some(3));
         let detail = block_on(client.get_subject_detail(45678)).unwrap();
@@ -2902,8 +2973,7 @@ mod tests {
         let payload = json!({"type": SubjectCollectionType::Doing.as_u32()});
         assert!(block_on(client.update_collection(45678, &payload)).is_ok());
         assert!(
-            block_on(client.update_episode_progress(98765, EpisodeCollectionType::Watched))
-                .is_ok()
+            block_on(client.update_episode_progress(98765, EpisodeCollectionType::Watched)).is_ok()
         );
         assert!(
             block_on(client.update_episode_progress_batch(
@@ -3031,7 +3101,10 @@ mod tests {
         assert_eq!(SubjectCollectionType::Doing.as_u32(), 3);
         assert_eq!(SubjectCollectionType::OnHold.as_u32(), 4);
         assert_eq!(SubjectCollectionType::Dropped.as_u32(), 5);
-        assert_eq!(SubjectCollectionType::from_u32(2), Some(SubjectCollectionType::Done));
+        assert_eq!(
+            SubjectCollectionType::from_u32(2),
+            Some(SubjectCollectionType::Done)
+        );
         assert_eq!(SubjectCollectionType::from_u32(6), None);
         // 单集进度：0 未收藏 / 1 想看 / 2 看过 / 3 抛弃。
         assert_eq!(EpisodeCollectionType::NotCollected.as_u32(), 0);
@@ -3054,10 +3127,7 @@ mod tests {
         assert_eq!(store.load().unwrap(), Some("secret-token".into()));
         store.clear().unwrap();
         assert_eq!(store.load().unwrap(), None);
-        assert!(matches!(
-            store.store("   "),
-            Err(TokenStoreError::Other(_))
-        ));
+        assert!(matches!(store.store("   "), Err(TokenStoreError::Other(_))));
     }
 
     #[test]
@@ -3182,22 +3252,26 @@ mod tests {
             },
         ));
         let client = HttpBangumiClient::with_base(mock_base(&server.url())).unwrap();
-        let page = http_block_on(
-            client.get_user_collections(
-                "collections-token",
-                "anilog_dev",
-                SUBJECT_TYPE_ANIME,
-                30,
-                0,
-            ),
-        )
+        let page = http_block_on(client.get_user_collections(
+            "collections-token",
+            "anilog_dev",
+            SUBJECT_TYPE_ANIME,
+            30,
+            0,
+        ))
         .unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.limit, 30);
         assert_eq!(page.data.len(), 2);
         assert_eq!(page.data[0].subject_id, 45678);
-        assert_eq!(page.data[0].collection_type, SubjectCollectionType::Doing.as_u32());
-        assert_eq!(page.data[1].collection_type, SubjectCollectionType::Dropped.as_u32());
+        assert_eq!(
+            page.data[0].collection_type,
+            SubjectCollectionType::Doing.as_u32()
+        );
+        assert_eq!(
+            page.data[1].collection_type,
+            SubjectCollectionType::Dropped.as_u32()
+        );
         // camelCase 前端投影。
         let item = bangumi_collection_json(&page.data[0]);
         assert_eq!(item["subjectId"], 45678);
@@ -3239,7 +3313,7 @@ mod tests {
             },
         ));
         let client = HttpBangumiClient::with_fallback(
-            reqwest::Client::new(),
+            test_http_client(),
             mock_base(&proxy.url()),
             mock_base(&official.url()),
         );
@@ -3256,7 +3330,7 @@ mod tests {
             |_method, _target, _headers, _request_body| (200, vec![], "[]".into()),
         ));
         let client = HttpBangumiClient::with_fallback(
-            reqwest::Client::new(),
+            test_http_client(),
             mock_base(&proxy.url()),
             mock_base(&official.url()),
         );
@@ -3273,7 +3347,7 @@ mod tests {
             |_method, _target, _headers, _request_body| (500, vec![], "official down".into()),
         ));
         let client = HttpBangumiClient::with_fallback(
-            reqwest::Client::new(),
+            test_http_client(),
             mock_base(&proxy.url()),
             mock_base(&official.url()),
         );
@@ -3287,11 +3361,7 @@ mod tests {
             |_method, _target, _headers, _request_body| (200, vec![], "[]".into()),
         ));
         let base = mock_base(&official.url());
-        let client = HttpBangumiClient::with_fallback(
-            reqwest::Client::new(),
-            base.clone(),
-            base,
-        );
+        let client = HttpBangumiClient::with_fallback(test_http_client(), base.clone(), base);
         assert!(http_block_on(client.get_calendar()).is_ok());
         assert_eq!(official.requests().len(), 1);
     }
@@ -3353,7 +3423,10 @@ mod tests {
         let assert_clean = |rendered: &str| {
             assert!(!rendered.contains("Bearer"), "leaks Bearer: {rendered}");
             assert!(!rendered.contains("token"), "leaks token: {rendered}");
-            assert!(!rendered.contains("Authorization"), "leaks header: {rendered}");
+            assert!(
+                !rendered.contains("Authorization"),
+                "leaks header: {rendered}"
+            );
             assert!(!rendered.contains(TOKEN), "leaks token value: {rendered}");
         };
 

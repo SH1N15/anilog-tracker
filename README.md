@@ -32,18 +32,18 @@ Local-first anime schedule, notification, episode task manager, optional Bangumi
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 正式版 v0.7.4
+### 正式版 v0.7.5
 
-GitHub 正式版仍以 `v0.7.4` 为稳定基线，已有正式安装包和下载链接保持不变。本地候选版 `v0.7.5-rc.3` 继续修正异常完成历史和观看进度，尚未公开发布。
+`v0.7.5` 是当前稳定版，请根据平台和 edition 下载对应安装包：
 
-- [`AniLog-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Windows-v0.7.4-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.7.4-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Original-Windows-v0.7.4-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.7.4-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Android-v0.7.4-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
-- [`AniLog-Original-Android-v0.7.4-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.4/AniLog-Original-Android-v0.7.4-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
+- [`AniLog-Windows-v0.7.5-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Windows-v0.7.5-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.7.5-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Original-Windows-v0.7.5-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.7.5-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Android-v0.7.5-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.7.5-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Original-Android-v0.7.5-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-`v0.7.4` 修复 Android 待看任务消失、提前提醒和更新时间反复待定，修复勾选或撤销后的观看进度不同步，以及手机进度文字竖排。共用 AniList ID 的分篇作品现在独立保留任务，自动补回任务不会覆盖已完成记录。完整变化和 SHA-256 见 [发布说明](release-notes/v0.7.4.md)。
+`v0.7.5` 修复取消追番被旧同步恢复、编辑后立即同步被云端旧值覆盖、异常未播出观看历史污染进度、后台同步静默停摆、Android 冷启动卡顿和切换系统代理后必须重启等问题，并显著减少 AniList 的重复请求。完整变化和 SHA-256 见 [发布说明](release-notes/v0.7.5.md)。
 
-**请同时升级 Windows 和 Android 对应版本**，让两端使用一致的任务合并规则。安装前备份 Windows 安装目录中的 `data`，退出包括托盘在内的电脑端程序后覆盖安装；Android 直接覆盖安装，不要先卸载。正式版 Android `versionCode=13`，可覆盖 `v0.7.3` 和本地测试版 `v0.7.4-rc.1`。
+**请同时升级 Windows 和 Android 对应版本**，让两端使用一致的同步、任务和观看历史规则。安装前备份 Windows 安装目录中的 `data`，退出包括托盘在内的电脑端程序后覆盖安装；Android 直接覆盖安装，不要先卸载。正式版 Android `versionCode=21`，可覆盖 `v0.7.4` 及已分发的 `v0.7.5` 候选版。
 
 - 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -87,7 +87,7 @@ npm run tauri:dev
 npm run tauri:dev:original
 ```
 
-`v0.7.4` 是当前 Tauri 2 正式版。共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。仅预览界面可使用 `npm run dev:tauri:web`；旧 `npm run dev` 启动的是 Electron 回退实现。Android 构建使用 JBR/JDK 21。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.7.5` 是当前 Tauri 2 正式版。共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。仅预览界面可使用 `npm run dev:tauri:web`；旧 `npm run dev` 启动的是 Electron 回退实现。Android 构建使用 JBR/JDK 21。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 
@@ -125,9 +125,10 @@ AniLog Original is a local-first anime schedule, release notification, and episo
 
 Download the bilingual Original builds from [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases). Windows 10/11 x64 and Android 7.0 or later are supported.
 
-Version 0.7.4 fixes task retention and sync consistency, premature Android alerts,
-stale progress, and narrow-screen progress layout. Upgrade both devices together
-and install the Android update over the existing app without uninstalling it.
+Version 0.7.5 fixes follow deletion and edit-sync conflicts, invalid future watch
+history, stalled background synchronization, Android cold starts, and live system
+proxy changes. Upgrade both devices together and install the Android update over
+the existing app without uninstalling it.
 
 中文标题首先来自 `bangumi-data` 的本地节目数据，缺失条目再通过 Bangumi API 查询。应用只查询进入可视区域且尚未缓存的条目，并在网络异常时自动暂停请求。
 

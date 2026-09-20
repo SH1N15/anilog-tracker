@@ -51,7 +51,10 @@ const BACKEND_MESSAGES: Array<[RegExp, string]> = [
   [/Token 不能为空/g, 'Token cannot be empty'],
   [/尚未保存 Bangumi Token/g, 'No Bangumi token saved yet'],
   [/Bangumi 授权失败，Token 可能已失效/g, 'Bangumi authorization failed; the token may have expired'],
-  [/无法连接 Bangumi 服务/g, 'Cannot reach the Bangumi service'],
+  [/无法连接 Bangumi 服务（网络连接被重置或拦截，请检查当前网络、VPN 或反代域名）/g, 'Cannot reach the Bangumi service (the network connection was reset or blocked; check the current network, VPN, or proxy domain)'],
+  [/Bangumi 服务连接超时（请检查当前网络、VPN 或反代域名）/g, 'The Bangumi service timed out (check the current network, VPN, or proxy domain)'],
+  [/Bangumi 反代返回 HTTP 502（反代暂时无法连接上游 Bangumi）/g, 'The Bangumi proxy returned HTTP 502 (it cannot currently reach the upstream Bangumi service)'],
+  [/Bangumi 反代返回 HTTP (\d+)/g, 'The Bangumi proxy returned HTTP $1'],
   [/Bangumi 安全存储不可用/g, 'Bangumi secure storage is unavailable'],
   [/当前平台不支持 Bangumi 账户同步/g, 'Bangumi account sync is not supported on this platform'],
 ];

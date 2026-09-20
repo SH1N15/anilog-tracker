@@ -394,6 +394,11 @@ pub(super) async fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "standard")]
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn directory() -> std::path::PathBuf {
@@ -514,7 +519,7 @@ mod tests {
     #[test]
     fn batches_cache_hits_manual_cooldown_and_new_follow_only_fetch_missing() {
         let server = server();
-        let client = reqwest::Client::new();
+        let client = test_http_client();
         let directory = directory();
         let requests: BTreeMap<i64, i64> = (1..=105).map(|id| (id, DAY)).collect();
         let rt = runtime();
@@ -592,7 +597,7 @@ mod tests {
             let directory = directory.clone();
             rt.spawn(async move {
                 media(
-                    &reqwest::Client::new(),
+                    &test_http_client(),
                     &url,
                     &directory,
                     &BTreeMap::from([(1, DAY)]),
@@ -606,7 +611,7 @@ mod tests {
             let url = server.url();
             rt.spawn(async move {
                 media(
-                    &reqwest::Client::new(),
+                    &test_http_client(),
                     &url,
                     &directory,
                     &BTreeMap::from([(1, DAY)]),
@@ -641,7 +646,7 @@ mod tests {
         )
         .unwrap();
         let requests = BTreeMap::from([(1, 300)]);
-        let client = reqwest::Client::new();
+        let client = test_http_client();
         let rt = runtime();
         let first = rt.block_on(media(
             &client,
