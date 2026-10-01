@@ -59,20 +59,46 @@ export function seasonLabel(season: Season, year: number, language: UiLanguage =
 }
 
 export function localAiringWeekday(anime: Anime, now = Math.floor(Date.now() / 1000)): number {
-  const fallbackAt = anime.nextAiringEpisode?.airingAt;
-  const scheduledAt = (anime.airingSchedule?.nodes || [])
-    .map((node) => node.airingAt)
-    .filter((airingAt) => Number.isFinite(airingAt) && airingAt > now)
-    .reduce<number | null>((earliest, airingAt) => earliest === null || airingAt < earliest ? airingAt : earliest, null);
-  const validFallbackAt = Number.isFinite(fallbackAt) && fallbackAt! > now ? fallbackAt! : null;
-  const airingAt = scheduledAt === null
-    ? validFallbackAt
-    : validFallbackAt === null
-      ? scheduledAt
-      : Math.min(scheduledAt, validFallbackAt);
-  if (airingAt === null) return 7;
-  const day = new Date(airingAt * 1000).getDay();
+  const nodes = [...(anime.airingSchedule?.nodes || []), ...(anime.nextAiringEpisode ? [anime.nextAiringEpisode] : [])];
+  const next = nodes.filter((node) => Number.isFinite(node.airingAt) && (
+    node.airingPrecision === 'date' || node.airingPrecision === 'unknown'
+      ? Math.floor(node.airingAt / 86400) >= Math.floor(now / 86400)
+      : node.airingAt > now
+  )).sort((a, b) => a.airingAt - b.airingAt)[0];
+  if (next) {
+    const date = new Date(next.airingAt * 1000);
+    const day = next.airingPrecision === 'date' || next.airingPrecision === 'unknown' ? date.getUTCDay() : date.getDay();
+    return day === 0 ? 6 : day - 1;
+  }
+  // Premiere dates and broadcaster weekdays belong to their source calendar.
+  // Do not invent a midnight instant or shift them into the device time zone.
+  if (Number.isInteger(anime.broadcastWeekday) && anime.broadcastWeekday! >= 1 && anime.broadcastWeekday! <= 7) {
+    return anime.broadcastWeekday! - 1;
+  }
+  const premiere = premiereDate(anime);
+  if (!premiere) return 7;
+  const day = premiere.getUTCDay();
   return day === 0 ? 6 : day - 1;
+}
+
+function premiereDate(anime: Anime): Date | null {
+  const { year, month, day } = anime.startDate || {};
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  const date = new Date(Date.UTC(year!, month! - 1, day!));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month! - 1 && date.getUTCDate() === day ? date : null;
+}
+
+export function seasonDateLabel(anime: Anime, language: UiLanguage = 'zh-CN'): string {
+  const premiere = premiereDate(anime);
+  if (premiere) {
+    const date = new Intl.DateTimeFormat(language, { month: 'numeric', day: 'numeric', weekday: 'short', timeZone: 'UTC' }).format(premiere);
+    return language === 'en-US' ? `Premiere ${date} · Time TBA` : `首播 ${date} · 时刻待定`;
+  }
+  if (Number.isInteger(anime.broadcastWeekday) && anime.broadcastWeekday! >= 1 && anime.broadcastWeekday! <= 7) {
+    const day = new Intl.DateTimeFormat(language, { weekday: 'long', timeZone: 'UTC' }).format(new Date(Date.UTC(2024, 0, anime.broadcastWeekday!)));
+    return language === 'en-US' ? `${day} · Time TBA` : `${day} · 时刻待定`;
+  }
+  return tr(language, '播出日期待定', 'Release date TBA');
 }
 
 export function formatAiring(timestamp?: number | null, includeDate = true, language: UiLanguage = 'zh-CN', precision?: string): string {

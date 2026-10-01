@@ -4,8 +4,9 @@
 
 ## 当前状态
 
-- 当前正式版：`v0.7.5`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，并标记为 GitHub Latest；Android `versionCode=21`。
-- 当前维护安排：维护者已完成 rc.1 至 rc.6 的双端验收并授权发布 `v0.7.5`。本版修复追番删除与编辑同步、AniList 请求缓存、异常观看历史、后台同步停摆、通知缺口、Android 冷启动和网络代理切换；公开默认 Bangumi 反代仍为 `https://sh1n.cc.cd/v0`。后续工作不得移动 `v0.7.5` 标签或覆盖其附件。
+- 当前正式版：`v0.7.6`，使用 React + Tauri 2 + Rust，共享 Windows/Android 业务核心，GitHub Latest；Android `versionCode=23`。
+- 维护者于 2026-10-01 确认 `v0.7.6-rc.1` 问题验收通过并授权发布 `v0.7.6`。季度运行时映射与日期展示契约见 [`docs/CATALOG_MAPPING.md`](docs/CATALOG_MAPPING.md)；换季不应依赖硬编码作品或重新发包。
+- 当前维护安排：本版修复季度新番全待定与旧追番映射停滞，保留 `v0.7.5` 的同步、历史、通知和网络生命周期修复；公开默认 Bangumi 反代仍为 `https://sh1n.cc.cd/v0`。后续工作不得移动已发布的 `v0.7.5` / `v0.7.6` 标签或覆盖附件。
 - Android 正式附件仅发布 `arm64-v8a`；Standard 与 Original 均不得回退为 universal APK。
 - `electron/` 和 `android/` 继续作为 v0.5 回退实现保留；删除旧架构必须另行规划，不得夹带在普通修改中。
 - 开始工作前先运行 `git status --short`，保留用户已有修改，不要擅自清理或重置。

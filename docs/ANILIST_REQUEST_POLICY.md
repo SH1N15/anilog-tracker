@@ -1,7 +1,12 @@
 # AniList Request Policy
 
-This policy applies to the Tauri v0.7.5 release. Electron and Capacitor
+This policy applies to the Tauri v0.7.6 release. Electron and Capacitor
 fallback implementations keep their existing caches.
+
+The v0.7.6 runtime catalog identity supplement and date-only display
+contract are documented in [CATALOG_MAPPING.md](CATALOG_MAPPING.md). It uses
+the same seasonal cache and per-ID request policy; unmapped future quarters
+do not require a new embedded mapping table or a new app release.
 
 ## Refresh Classes
 
