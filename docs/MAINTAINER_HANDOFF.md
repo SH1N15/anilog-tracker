@@ -2,7 +2,7 @@
 
 本文档面向后续维护者和 AI，记录项目事实、关键行为和发布约束。它不是用户使用手册，也不包含任何密码、密钥或账户信息。
 
-> `v0.7.5` 正式版汇总 rc.1 至 rc.6 的追番删除、编辑同步、请求缓存、异常观看历史、后台同步、通知、Android 冷启动和网络代理生命周期修复。维护者于 2026-09-20 完成双端验收并授权正式发布；正式包使用 `versionCode=21` 重新构建，不把 rc 安装包改名冒充正式包。Standard 仍由 Bangumi 确认逐集身份，AniList 只补充已匹配集数的精确时间；日期占位不得用于精确提醒。
+> `v0.7.6` 修复季度映射对旧内置表的依赖及旧追番待确认停滞。维护者于 2026-10-01 完成 rc.1 问题验收并授权正式发布；正式包使用 `versionCode=23` 重新构建，不把 rc 安装包改名冒充正式包。Standard 仍由 Bangumi 确认逐集身份，AniList 补充精确时间；目录日期不创建任务或精确提醒。
 
 ## 1. 项目现状
 
@@ -10,10 +10,10 @@ AniLog 是本地优先的 Windows/Android 追番工具，提供季度新番、�
 
 - 仓库：`https://github.com/SH1N15/anilog-tracker`
 - 正式架构：React + Tauri 2 + Rust
-- 正式版：`v0.7.5`，GitHub Latest
-- 当前开发基线：`v0.7.5`，由 `v0.7.4`（`090593d`）之后的 rc.1 至 rc.6 修复收口。
-- 当前维护安排（2026-09-20）：维护者已验证 Android 冷启动和 Windows/Android 网络切换，并授权正式发布。公开默认 Bangumi 反代保持 `https://sh1n.cc.cd/v0`；私人备用反代不得写入代码、文档、日志或 Release。后续不得移动 `v0.7.5` 标签、覆盖附件或删除本机发布备份。
-- Android `versionCode`：`21`（上一正式版 `v0.7.4` 为 `13`，最后一个候选版 rc.6 为 `20`）
+- 正式版：`v0.7.6`，GitHub Latest
+- 当前开发基线：`v0.7.6`，包含 v0.7.5 的同步/通知修复及 v0.7.6-rc.1 验收通过的季度/映射修复。
+- 当前维护安排（2026-10-01）：维护者确认季度表及旧追番映射等问题验收通过并授权正式发布。公开默认 Bangumi 反代保持 `https://sh1n.cc.cd/v0`；私人备用反代不得写入代码、文档、日志或 Release。后续不得移动已发布标签、覆盖附件或删除本机发布备份。
+- Android `versionCode`：`23`（上一正式版 `v0.7.5` 为 `21`，`v0.7.6-rc.1` 为 `22`）
 - Android 正式 Release 附件 ABI：仅 `arm64-v8a`；Debug 配置仍可能包含其他 ABI，不能将正式包限制泛化到开发包
 
 候选版变更契约见 [WATCH_STATE_REGRESSIONS.md](WATCH_STATE_REGRESSIONS.md) 与
@@ -220,7 +220,7 @@ Windows Standard 与 Original 共用 bundle 输出目录，Android 两个 editio
 9. 使用 `apksigner verify --verbose --print-certs`、`aapt dump badging`、`zipalign -c -P 16 -v 4` 和 ZIP 文件清单验证签名、包名、版本、对齐和 ABI。
 10. 计算四件套 SHA-256，写入 `release-notes/vX.Y.Z.md`，再提交、打标签和创建正式 Release。
 
-当前正式包存放在本机 `release/tauri-v0.7.5/`；旧 `release/tauri-v0.7.4/` 与 `release/tauri-v0.7.5-rc.*` 保留为验收和回退备份，
+当前正式包存放在本机 `release/tauri-v0.7.6/`；`release/tauri-v0.7.6-rc.1/` 保留为验收备份，历史发布包若仍存在也应保留，
 不会上传为正式附件。安装包、签名中间产物和本地交接文件不进入 Git。
 
 虽然 Tauri 产物路径中写着 `universal`，只要构建命令带 `--target aarch64`，最终包可以且应该只有 `lib/arm64-v8a/libanilog_lib.so`；是否为单 ABI 必须看 APK 内容，不能根据目录名判断。
@@ -279,6 +279,8 @@ Android 每个 edition 31 项、12 个 Node 脚本，以及 320/390/768/1280 宽
 当前 [`RELEASING.md`](RELEASING.md) 以 Tauri 正式发布流程为主，并保留 v0.5 Electron/Capacitor 回退说明。不要运行旧流程中的 `dist:all` 当作 Tauri 包。
 
 ## 12. 已知风险与后续事项
+
+- `v0.7.6`（Android `versionCode=23`）正式包含季度映射及旧追番迁移修复。运行时关联、日期级展示及迁移验证契约见 [CATALOG_MAPPING.md](CATALOG_MAPPING.md)。后续换季不得靠硬编码作品/日期或重新发包更新映射解决。
 
 - Tauri 已成为正式架构，仍需继续收集 Windows/Android 反馈。
 - CSP 仍关闭，需另行安排双端安全加固；详见 [`REVIEW_FOLLOWUPS.md`](REVIEW_FOLLOWUPS.md)，不把历史已修复项继续当作当前故障。

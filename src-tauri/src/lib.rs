@@ -35,6 +35,9 @@ compile_error!("either Cargo feature `standard` or `original` must be enabled");
 #[cfg(feature = "standard")]
 pub mod bangumi;
 
+#[cfg(feature = "standard")]
+mod catalog_mapping;
+
 mod anilist_cache;
 #[cfg(target_os = "android")]
 mod mobile;
@@ -235,9 +238,15 @@ fn normalize_state_records_for_standard(state: &mut Value) {
         for item in following {
             if value_string(item.get("source")).is_empty() {
                 item["source"] = json!("anilist");
-                item["anilistId"] = Value::Null;
-                item["mapping"] = Value::Null;
-                item["mappingPending"] = json!(false);
+                for (key, default) in [
+                    ("anilistId", Value::Null),
+                    ("mapping", Value::Null),
+                    ("mappingPending", json!(false)),
+                ] {
+                    if item.get(key).is_none() {
+                        item[key] = default;
+                    }
+                }
             }
             // Phase 3 任务 1：收藏/评分/进度镜像字段（get_state/public_state
             // 自然带出；缺省 null）。
@@ -987,7 +996,6 @@ fn auto_map_following(state: &mut Value, map: &Value) -> usize {
                     .get("mapping")
                     .filter(|value| !value.is_null())
                     .is_none()
-                && !value_bool(item.get("mappingPending"))
         })
         .map(|item| value_i64(item.get("id")))
         .collect();
@@ -2164,22 +2172,6 @@ fn season_cache_ttl_millis(season: &str, year: i64, current_year: i64, current_m
     }
 }
 
-async fn anilist_request(
-    context: &AppContext,
-    query: &str,
-    variables: Value,
-) -> anyhow::Result<Value> {
-    let client = context.http_client()?;
-    anilist_cache::request(
-        &client,
-        ANILIST_API,
-        query,
-        variables,
-        Some(&context.cache_dir.join("anilist-cache")),
-    )
-    .await
-}
-
 fn season_cache_path(context: &AppContext, season: &str, year: i64) -> PathBuf {
     context.cache_dir.join(format!("{year}-{season}.json"))
 }
@@ -2208,25 +2200,31 @@ fn annotate_anime_sources(mut anime: Vec<Value>, original: bool) -> Vec<Value> {
     anime
 }
 
-async fn fetch_season_network(
-    context: &AppContext,
+async fn fetch_season_network_from(
+    client: &reqwest::Client,
+    endpoint: &str,
+    cache_root: &Path,
     season: &str,
     year: i64,
 ) -> anyhow::Result<Vec<Value>> {
-    let first = anilist_request(
-        context,
+    let first = anilist_cache::request(
+        client,
+        endpoint,
         SEASON_QUERY,
         json!({"season": season, "year": year, "page": 1}),
+        Some(&cache_root.join("anilist-cache")),
     )
     .await?;
     let page = &first["Page"];
     let last_page = value_i64(page["pageInfo"].get("lastPage")).clamp(1, 5);
     let mut all = page["media"].as_array().cloned().unwrap_or_default();
     for page_number in 2..=last_page {
-        let next = anilist_request(
-            context,
+        let next = anilist_cache::request(
+            client,
+            endpoint,
             SEASON_QUERY,
             json!({"season": season, "year": year, "page": page_number}),
+            Some(&cache_root.join("anilist-cache")),
         )
         .await?;
         all.extend(
@@ -2250,7 +2248,28 @@ async fn fetch_season_anilist_cached(
     year: i64,
     force: bool,
 ) -> anyhow::Result<(Vec<Value>, i64, bool)> {
-    let cache_path = season_cache_path(context, season, year);
+    fetch_season_anilist_cached_from(
+        &context.http_client()?,
+        ANILIST_API,
+        &context.cache_dir,
+        season,
+        year,
+        force,
+        context.original,
+    )
+    .await
+}
+
+async fn fetch_season_anilist_cached_from(
+    client: &reqwest::Client,
+    endpoint: &str,
+    cache_root: &Path,
+    season: &str,
+    year: i64,
+    force: bool,
+    original: bool,
+) -> anyhow::Result<(Vec<Value>, i64, bool)> {
+    let cache_path = cache_root.join(format!("{year}-{season}.json"));
     if let Ok(body) = fs::read_to_string(&cache_path) {
         if let Ok(entry) = serde_json::from_str::<Value>(&body) {
             let age = now_millis() - value_i64(entry.get("fetchedAt"));
@@ -2268,7 +2287,7 @@ async fn fetch_season_anilist_cached(
                 return Ok((
                     annotate_anime_sources(
                         entry["anime"].as_array().cloned().unwrap_or_default(),
-                        context.original,
+                        original,
                     ),
                     value_i64(entry.get("fetchedAt")),
                     true,
@@ -2277,8 +2296,8 @@ async fn fetch_season_anilist_cached(
         }
     }
     let anime = annotate_anime_sources(
-        fetch_season_network(context, season, year).await?,
-        context.original,
+        fetch_season_network_from(client, endpoint, cache_root, season, year).await?,
+        original,
     );
     for item in &anime {
         let id = value_i64(item.get("id"));
@@ -2287,7 +2306,7 @@ async fn fetch_season_anilist_cached(
             media["futureAiringSchedule"] = item["airingSchedule"].clone();
             media["airingSchedule"] = item["airedEpisodes"].clone();
             let _ = anilist_cache::store_snapshot(
-                &context.cache_dir.join("anilist-cache"),
+                &cache_root.join("anilist-cache"),
                 id,
                 &anilist_cache::Snapshot {
                     fetched_at: now_seconds(),
@@ -2321,7 +2340,15 @@ async fn fetch_season(
             let today = Local::now();
             let ttl =
                 season_cache_ttl_millis(&season, year, i64::from(today.year()), today.month());
-            if now_millis().saturating_sub(fetched_at) >= ttl {
+            #[allow(unused_mut)]
+            let mut refresh_due = now_millis().saturating_sub(fetched_at) >= ttl;
+            #[cfg(feature = "standard")]
+            if !context.original {
+                refresh_due |= bangumi_season_needs_upgrade(
+                    &bangumi_cache_dir(&context).join(format!("{year}-{season}.json")),
+                );
+            }
+            if refresh_due {
                 let context = context.inner().clone();
                 let app = app.clone();
                 let season = season.clone();
@@ -2407,6 +2434,19 @@ async fn refresh_season(
                 fetched_at,
                 stale,
             } => {
+                let changed = {
+                    let mut state = context.state.lock().map_err(|_| "状态锁不可用")?;
+                    catalog_mapping::apply_catalog(&mut state, &anime)
+                };
+                if changed {
+                    context.save_state().map_err(|error| error.to_string())?;
+                    context.webdav_wakeup.notify_one();
+                    context.sync_wakeup.notify_one();
+                    refresh_mobile_configuration(app, context)?;
+                    #[cfg(target_os = "android")]
+                    enqueue_native_sync(app);
+                    emit_state(app, context);
+                }
                 let _ = app.emit(
                     "season-updated",
                     json!({"season": season, "year": year, "anime": anime, "fetchedAt": fetched_at, "stale": stale}),
@@ -2478,7 +2518,7 @@ async fn anilist_enrich_season_anime(
     source: &AniListSeasonSource<'_>,
     mut anime: Vec<Value>,
     force: bool,
-) -> Vec<Value> {
+) -> (Vec<Value>, bool) {
     let ids: BTreeMap<i64, i64> = anime
         .iter()
         .map(|item| value_i64(item.get("anilistId")))
@@ -2486,7 +2526,7 @@ async fn anilist_enrich_season_anime(
         .map(|id| (id, anilist_cache::DAY))
         .collect();
     if ids.is_empty() {
-        return anime;
+        return (anime, false);
     }
     let batch = anilist_cache::media(
         &source.client,
@@ -2497,9 +2537,10 @@ async fn anilist_enrich_season_anime(
         now_seconds(),
     )
     .await;
+    let incomplete = !batch.warnings.is_empty();
     let media_by_id = batch.snapshots;
     if media_by_id.is_empty() {
-        return anime;
+        return (anime, incomplete);
     }
     for item in anime.iter_mut() {
         let anilist_id = value_i64(item.get("anilistId"));
@@ -2556,7 +2597,7 @@ async fn anilist_enrich_season_anime(
             fill(item, "studios", &media["studios"]);
         }
     }
-    anime
+    (anime, incomplete)
 }
 
 /// Bangumi 专属缓存目录（季度列表 / subject extras，schema §7）。放在
@@ -2632,7 +2673,10 @@ async fn fetch_season_bangumi_chain_with_policy(
         } else {
             season_cache_ttl_millis(season, year, i64::from(today.year()), today.month())
         };
-        if now_millis() >= fetched_at && now_millis() - fetched_at < ttl {
+        if now_millis() >= fetched_at
+            && now_millis() - fetched_at < ttl
+            && !bangumi_season_needs_upgrade(&cache_path)
+        {
             return SeasonFetch::Bangumi {
                 anime: normalize_season_anime_episode_authority(cache_dir, anime, now_seconds()),
                 fetched_at,
@@ -2653,16 +2697,54 @@ async fn fetch_season_bangumi_chain_with_policy(
                 year,
                 now_seconds(),
             );
+            if let Some((previous, _)) = read_bangumi_season_cache(&cache_path, false) {
+                catalog_mapping::retain_links(&mut anime, &previous);
+            }
+            let mut incomplete = false;
             // 问题 D ①：AniList 补充覆盖（nextAiringEpisode 权威 / airingSchedule
             // 填入 / 补充字段；失败静默保留 bangumi-data 值）。随缓存一并落盘。
             if let Some(source) = anilist {
-                anime = anilist_enrich_season_anime(source, anime, force).await;
+                // The installed offline table is only a seed. Discover current
+                // identities from both live seasonal catalogs, using the shared
+                // catalog cache and rate limit rather than one search per card.
+                catalog_mapping::link_catalog(&mut anime, &[], state);
+                if anime
+                    .iter()
+                    .any(|item| value_i64(item.get("anilistId")) <= 0)
+                {
+                    let root = source.cache_dir.parent().unwrap_or(cache_dir);
+                    match fetch_season_anilist_cached_from(
+                        &source.client,
+                        source.endpoint,
+                        root,
+                        season,
+                        year,
+                        force,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok((catalog, _, _)) => {
+                            catalog_mapping::link_catalog(&mut anime, &catalog, state)
+                        }
+                        Err(_) => {
+                            incomplete = true;
+                            warn!(
+                                "AniList seasonal identity supplement unavailable; retaining Bangumi dates"
+                            );
+                        }
+                    }
+                }
+                let (enriched, failed) = anilist_enrich_season_anime(source, anime, force).await;
+                anime = enriched;
+                incomplete |= failed;
             }
             anime = normalize_season_anime_episode_authority(cache_dir, anime, now_seconds());
             let fetched_at = now_millis();
             let entry = json!({
                 "version": CACHE_VERSION, "season": season, "year": year,
-                "source": "bangumi", "fetchedAt": fetched_at, "anime": anime
+                "source": "bangumi", "fetchedAt": fetched_at, "anime": anime,
+                "catalogRevision": catalog_mapping::SEASON_REVISION
             });
             let temporary = cache_path.with_extension("json.tmp");
             if let Ok(body) = serde_json::to_vec(&entry) {
@@ -2673,7 +2755,7 @@ async fn fetch_season_bangumi_chain_with_policy(
             SeasonFetch::Bangumi {
                 anime,
                 fetched_at,
-                stale: false,
+                stale: incomplete,
             }
         }
         Err(error) => {
@@ -2811,6 +2893,14 @@ fn read_bangumi_season_cache(cache_path: &Path, fresh_only: bool) -> Option<(Vec
     ))
 }
 
+#[cfg(feature = "standard")]
+fn bangumi_season_needs_upgrade(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .is_some_and(|entry| entry["catalogRevision"] != catalog_mapping::SEASON_REVISION)
+}
+
 /// 将季度卡片中的 AniList 播出编号重新绑定到 Bangumi 分季的本地集号。
 ///
 /// 季度缓存最初由 AniList 批量补充生成，分季条目可能因此携带全局/主条目
@@ -2859,7 +2949,7 @@ fn normalize_season_anime_episode_authority(
             }
         }
         let schedule = bangumi_episode_schedule_with_precision(&records, now, &precise);
-        let Some((episode, _, airing_at, _)) =
+        let Some((episode, episode_id, airing_at, _)) =
             schedule.iter().find(|(_, _, _, aired)| !*aired).copied()
         else {
             if !schedule.is_empty() {
@@ -2871,7 +2961,8 @@ fn normalize_season_anime_episode_authority(
             "episode": episode,
             "airingAt": airing_at,
             "timeUntilAiring": (airing_at - now).max(0),
-            "source": "bangumi_episode"
+            "source": "bangumi_episode",
+            "airingPrecision": if resolved_airing_is_precise(&records, episode_id, airing_at, Some(&precise)) { "instant" } else { "date" }
         });
     }
     anime
@@ -3089,6 +3180,7 @@ fn map_subjects_to_anime(
                 "season": season,
                 "seasonYear": year,
                 "startDate": start_date.unwrap_or(Value::Null),
+                "broadcastWeekday": catalog_mapping::broadcast_weekday(subject),
                 "averageScore": subject.rating.as_ref().and_then(|rating| rating.score),
                 "genres": [],
                 "format": bangumi_platform_to_format(subject.platform.as_deref()),
@@ -3606,8 +3698,27 @@ fn refresh_new_follow_schedules(app: &AppHandle, context: &AppContext, added: Ve
         }
         #[cfg(target_os = "android")]
         for entry in added {
-            let _ =
-                mobile::sync_native_with_policy(&app, &context, true, value_i64(entry.get("id")));
+            let target = value_i64(entry.get("id"));
+            #[cfg(feature = "standard")]
+            catalog_mapping::repair_following(&app, &context, true, Some(&HashSet::from([target])))
+                .await;
+            let target = context
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state["following"]
+                        .as_array()?
+                        .iter()
+                        .find(|item| {
+                            value_i64(item.get("id")) == target
+                                || (item["source"] == "bangumi"
+                                    && value_i64(item.get("anilistId")) == target)
+                        })
+                        .map(|item| value_i64(item.get("id")))
+                })
+                .unwrap_or(target);
+            let _ = mobile::sync_native_with_policy(&app, &context, true, target);
         }
     });
 }
@@ -4053,6 +4164,8 @@ fn is_valid_reminder_time(time: &str) -> bool {
 async fn sync_now(app: AppHandle, context: State<'_, AppContext>) -> Result<Value, String> {
     #[cfg(target_os = "android")]
     {
+        #[cfg(feature = "standard")]
+        catalog_mapping::repair_following(&app, &context, true, None).await;
         let status = mobile::sync_native_with_policy(&app, &context, true, 0)
             .map_err(|error| error.to_string())?;
         let created = value_i64(status.get("created"));
@@ -5834,6 +5947,18 @@ async fn sync_schedules(
     only: Option<HashSet<i64>>,
 ) -> Result<Value, String> {
     let _guard = context.schedule_sync_lock.lock().await;
+    #[cfg(feature = "standard")]
+    catalog_mapping::repair_following(app, context, force, only.as_ref()).await;
+    let only = only.map(|mut ids| {
+        if let Ok(state) = context.state.lock() {
+            for entry in state["following"].as_array().into_iter().flatten() {
+                if ids.contains(&value_i64(entry.get("anilistId"))) {
+                    ids.insert(value_i64(entry.get("id")));
+                }
+            }
+        }
+        ids
+    });
     let (requests, known) = {
         let state = context.state.lock().map_err(|_| "状态锁不可用")?;
         let selected: Vec<&Value> = state["following"]
@@ -6538,14 +6663,17 @@ mod bangumi_commands {
     pub(super) fn request_error_message(error: BangumiApiError) -> String {
         match error {
             BangumiApiError::Unauthorized { .. } => "Bangumi 授权失败，Token 可能已失效".into(),
-            BangumiApiError::Network(_) =>
-                "无法连接 Bangumi 服务（网络连接被重置或拦截，请检查当前网络、VPN 或反代域名）".into(),
-            BangumiApiError::Timeout =>
-                "Bangumi 服务连接超时（请检查当前网络、VPN 或反代域名）".into(),
-            BangumiApiError::ServerError(502) =>
-                "Bangumi 反代返回 HTTP 502（反代暂时无法连接上游 Bangumi）".into(),
-            BangumiApiError::ServerError(status) =>
-                format!("Bangumi 反代返回 HTTP {status}"),
+            BangumiApiError::Network(_) => {
+                "无法连接 Bangumi 服务（网络连接被重置或拦截，请检查当前网络、VPN 或反代域名）"
+                    .into()
+            }
+            BangumiApiError::Timeout => {
+                "Bangumi 服务连接超时（请检查当前网络、VPN 或反代域名）".into()
+            }
+            BangumiApiError::ServerError(502) => {
+                "Bangumi 反代返回 HTTP 502（反代暂时无法连接上游 Bangumi）".into()
+            }
+            BangumiApiError::ServerError(status) => format!("Bangumi 反代返回 HTTP {status}"),
             other => other.to_string(),
         }
     }
@@ -8005,6 +8133,7 @@ async fn run_full_bangumi_sync_with_policy(
     //    语义，经 async 块延迟到步骤 2 位置执行）；桌面复用 sync_now_inner。
     #[cfg(target_os = "android")]
     let schedule = async move {
+        catalog_mapping::repair_following(app, context, force, None).await;
         mobile::sync_native_with_policy(app, context, force, 0).map_err(|error| error.to_string())
     };
     #[cfg(not(target_os = "android"))]
@@ -12342,7 +12471,8 @@ mod tests {
         let cache_path = directory.join("2026-SUMMER.json");
         let mut cached: Value =
             serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
-        cached["fetchedAt"] = json!(now_millis() - 25 * 3_600_000);
+        // Older quarters use a 30-day TTL. Remain expired after the real calendar rolls over.
+        cached["fetchedAt"] = json!(now_millis() - 31 * 86_400_000);
         fs::write(&cache_path, serde_json::to_vec(&cached).unwrap()).unwrap();
         let SeasonFetch::Bangumi {
             anime,

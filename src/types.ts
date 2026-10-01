@@ -23,6 +23,8 @@ export interface Anime {
   season?: Season | null;
   seasonYear?: number | null;
   startDate?: { year?: number; month?: number; day?: number };
+  // Date-only metadata in the broadcaster's calendar; never a notification instant.
+  broadcastWeekday?: number | null;
   studios?: { nodes: Array<{ name: string }> };
   genres?: string[];
   averageScore?: number | null;

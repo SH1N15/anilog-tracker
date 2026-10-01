@@ -53,6 +53,7 @@ import {
   formatAiring,
   formatLabel,
   localAiringWeekday,
+  seasonDateLabel,
   relativeTime,
   reminderTitleOf,
   SEASONS,
@@ -685,8 +686,8 @@ function SeasonView({
         <div>
           <div className="eyebrow"><Sparkles size={14} /> {seasonLabel(season, year, language)}</div>
           <h2>{t('新番更新时间表', 'Seasonal release schedule')}</h2>
-          <p>{loading ? (IS_ORIGINAL_EDITION ? t('正在读取 AniList…', 'Loading AniList…') : t('正在读取新番数据…', 'Loading seasonal data…')) : t(`${anime.length} 部作品 · 时间按本机时区显示`, `${anime.length} titles · Times shown in your local time zone`)}
-            {!loading && seasonStale && <span style={{ display: 'block', fontSize: 12, opacity: 0.75 }}>{t('网络暂时不可用，已显示缓存数据', 'Network unavailable — showing cached data')}</span>}
+          <p>{loading ? (IS_ORIGINAL_EDITION ? t('正在读取 AniList…', 'Loading AniList…') : t('正在读取新番数据…', 'Loading seasonal data…')) : t(`${anime.length} 部作品 · 精确时间按本机时区显示，未定时刻保留原播出日期`, `${anime.length} titles · Exact times are local; date-only listings use the broadcast calendar`)}
+            {!loading && seasonStale && <span style={{ display: 'block', fontSize: 12, opacity: 0.75 }}>{t('部分数据暂未刷新，已保留可用的日期和缓存', 'Some data could not refresh; available dates and cached data are shown')}</span>}
           </p>
         </div>
         <div className="filter-row">
@@ -835,7 +836,7 @@ const AnimeCard = memo(function AnimeCard({
         <p className="anime-subtitle">{originalTitle !== displayTitle ? originalTitle : secondaryTitle(anime.title, language) || anime.studios?.nodes[0]?.name || t('制作信息待定', 'Studio TBA')}</p>
         <div className="airing-line">
           <Clock3 size={15} />
-          <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : t('更新时间待定', 'Schedule TBA')}</span>
+          <span>{next ? t(`第 ${next.episode} 集 · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}${next.airingPrecision === 'date' ? ' · 时刻待定' : ''}`, `Episode ${next.episode} · ${formatAiring(next.airingAt, true, language, next.airingPrecision)}${next.airingPrecision === 'date' ? ' · Time TBA' : ''}`) : anime.status === 'FINISHED' ? t('本季已完结', 'Finished') : seasonDateLabel(anime, language)}</span>
         </div>
         <button className={`follow-button ${followed ? 'followed' : ''}`} disabled={followBusy} onClick={() => onToggle(anime)}>
           {followed ? <Check size={17} /> : <Bell size={17} />}
@@ -974,6 +975,9 @@ function AnimeDetail({ anime, titleMatch, titlePreference, language, followed, o
                 <Clock3 size={19} />
                 <div><strong>{t(`第 ${anime.nextAiringEpisode.episode} 集`, `Episode ${anime.nextAiringEpisode.episode}`)}</strong><span>{formatAiring(anime.nextAiringEpisode.airingAt, true, language, anime.nextAiringEpisode.airingPrecision)} · {relativeTime(anime.nextAiringEpisode.airingAt, language, anime.nextAiringEpisode.airingPrecision)}</span></div>
               </div>
+            )}
+            {!anime.nextAiringEpisode && anime.status !== 'FINISHED' && (
+              <div className="next-airing"><Clock3 size={19} /><span>{seasonDateLabel(anime, language)}</span></div>
             )}
             <div className="detail-actions">
               <button className={`primary-button ${followed ? 'subtle' : ''}`} onClick={onToggle}>

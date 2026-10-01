@@ -32,18 +32,18 @@ Local-first anime schedule, notification, episode task manager, optional Bangumi
 
 前往 [GitHub Releases](https://github.com/SH1N15/anilog-tracker/releases) 下载需要的版本：
 
-### 正式版 v0.7.5
+### 正式版 v0.7.6
 
-`v0.7.5` 是当前稳定版，请根据平台和 edition 下载对应安装包：
+`v0.7.6` 是当前稳定版，请根据平台和 edition 下载对应安装包：
 
-- [`AniLog-Windows-v0.7.5-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Windows-v0.7.5-x64-setup.exe)：Windows 标准版
-- [`AniLog-Original-Windows-v0.7.5-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Original-Windows-v0.7.5-x64-setup.exe)：Windows 原名版
-- [`AniLog-Android-v0.7.5-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Android-v0.7.5-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
-- [`AniLog-Original-Android-v0.7.5-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.5/AniLog-Original-Android-v0.7.5-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
+- [`AniLog-Windows-v0.7.6-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.6/AniLog-Windows-v0.7.6-x64-setup.exe)：Windows 标准版
+- [`AniLog-Original-Windows-v0.7.6-x64-setup.exe`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.6/AniLog-Original-Windows-v0.7.6-x64-setup.exe)：Windows 原名版
+- [`AniLog-Android-v0.7.6-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.6/AniLog-Android-v0.7.6-arm64-v8a.apk)：Android 标准版，仅支持 arm64-v8a
+- [`AniLog-Original-Android-v0.7.6-arm64-v8a.apk`](https://github.com/SH1N15/anilog-tracker/releases/download/v0.7.6/AniLog-Original-Android-v0.7.6-arm64-v8a.apk)：Android 原名版，仅支持 arm64-v8a
 
-`v0.7.5` 修复取消追番被旧同步恢复、编辑后立即同步被云端旧值覆盖、异常未播出观看历史污染进度、后台同步静默停摆、Android 冷启动卡顿和切换系统代理后必须重启等问题，并显著减少 AniList 的重复请求。完整变化和 SHA-256 见 [发布说明](release-notes/v0.7.5.md)。
+`v0.7.6` 修复新季度作品全部显示“播出日待定”和旧追番长期“待确认映射”的问题。标准版在运行时核验季度目录关联，换季不再依赖重新发包；已公布日期但缺少精确时刻的作品显示“首播日期 · 时刻待定”，并保留已有观看历史。完整变化和 SHA-256 见 [发布说明](release-notes/v0.7.6.md)。
 
-**请同时升级 Windows 和 Android 对应版本**，让两端使用一致的同步、任务和观看历史规则。安装前备份 Windows 安装目录中的 `data`，退出包括托盘在内的电脑端程序后覆盖安装；Android 直接覆盖安装，不要先卸载。正式版 Android `versionCode=21`，可覆盖 `v0.7.4` 及已分发的 `v0.7.5` 候选版。
+**请同时升级 Windows 和 Android 对应版本**，让两端使用一致的同步、任务和观看历史规则。安装前备份 Windows 安装目录中的 `data`，退出包括托盘在内的电脑端程序后覆盖安装；Android 直接覆盖安装，不要先卸载。正式版 Android `versionCode=23`，可覆盖 `v0.7.5` 及 `v0.7.6-rc.1`。
 
 - 支持 Windows 10/11 x64，以及使用 arm64-v8a 的 Android 7.0 或更高版本
 - 番剧日程需要网络连接；标准版的在线中文标题查询还会访问 Bangumi API 或配置的反代
@@ -87,7 +87,7 @@ npm run tauri:dev
 npm run tauri:dev:original
 ```
 
-`v0.7.5` 是当前 Tauri 2 正式版。共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。仅预览界面可使用 `npm run dev:tauri:web`；旧 `npm run dev` 启动的是 Electron 回退实现。Android 构建使用 JBR/JDK 21。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
+`v0.7.6` 是当前 Tauri 2 正式版。共享 React 界面与 Rust 核心；旧 Electron/Capacitor 代码暂时保留为回退路径。仅预览界面可使用 `npm run dev:tauri:web`；旧 `npm run dev` 启动的是 Electron 回退实现。Android 构建使用 JBR/JDK 21。当前状态、构建命令和回归重点见 [docs/TAURI_MIGRATION.md](docs/TAURI_MIGRATION.md)。
 
 完整的环境配置、构建和测试说明见 [CONTRIBUTING.md](CONTRIBUTING.md)，维护者发布版本时请参考 [docs/RELEASING.md](docs/RELEASING.md)。
 
@@ -100,7 +100,7 @@ npm run tauri:dev:original
 5. 如需双端同步，在两台设备的“偏好设置 → 跨设备同步”中填写同一个 WebDAV 账户，测试成功后启用同步。
 6. 标准版如需同步 Bangumi 追番、评分或观看进度，在“偏好设置 → Bangumi 账户”填写 Access Token；它与 WebDAV 同步相互独立。
 
-每日待看提醒默认关闭，可在“偏好设置 → 更新提醒”中启用并选择时间。提醒只读取当前设备的本地任务，不会额外访问 AniList、Bangumi 或 WebDAV；没有待看任务时不会显示通知。设备在设定时间关机或休眠时，AniLog 会在下次启动或恢复后补发当日提醒，同一天最多发送一次。
+每日待看提醒默认关闭，可在“偏好设置 → 更新提醒”中启用并选择时间；没有待看任务时不会显示通知，同一天最多发送一次。Windows 在提醒前发现 WebDAV 数据较旧时会尝试同步后再计数。Android 打开应用不会补发错过的每日汇总，后台提醒由系统调度，可能受设备省电策略影响。
 
 WebDAV 会在应用启动或恢复前台、数据发生修改时检查更新，也可手动点击“立即同步”；Windows 后台运行期间还会每 15 分钟检查一次，Android 不需要为 WebDAV 常驻后台。同步文件位于 WebDAV 根目录的 `AniLog/anilog-sync.json`。Windows 使用系统安全存储加密密码，Android 使用系统 Keystore；坚果云等服务应填写第三方应用密码，而不是账户登录密码。服务不可用时，本地追番、任务和通知不受影响。
 
@@ -108,7 +108,7 @@ Windows 开机自启使用隐藏启动参数，登录后直接驻留托盘，不
 
 Android 首次追番时需要允许通知。未授予“准时通知”权限时系统仍会发送通知，但可能略有延迟；部分设备还需要将 AniLog 的电池策略设为“不限制”。在系统设置中“强行停止”应用会暂停后台调度，重新打开一次即可恢复。
 
-标准版以 Bangumi 为季度条目和逐集身份的主数据源，使用 `bangumi-data` 提供离线映射和元数据，使用 AniList 补充匹配集数的分钟级播出时间；Bangumi 季度链不可用且无缓存时可回退到 AniList。基础功能无需账号；Bangumi Access Token 在连接账户后用于认证请求。AniList 暂时不可用时，应用保留最近一次可信的精确时间或退回日期级信息，不按周播锚点猜测集数，也不会把日期占位当成精确播出时间发送 Android 提醒。
+标准版以 Bangumi 为季度条目和逐集身份的主数据源，使用 `bangumi-data` 提供初始离线关联，并在运行时核验 Bangumi/AniList 季度目录以发现新关联，使用 AniList 补充匹配集数的分钟级播出时间；Bangumi 季度链不可用且无缓存时可回退到 AniList。基础功能无需账号；Bangumi Access Token 在连接账户后用于认证请求。AniList 暂时不可用时，应用保留最近一次可信的精确时间或退回日期级信息，不按周播锚点猜测集数，也不会把日期占位当成精确播出时间发送 Android 提醒。
 
 Bangumi 账户同步与 WebDAV 是两个独立通道。Bangumi 账户同步可以拉取追番状态、回写本地状态/评分/观看进度；WebDAV 只同步 `following`、`tasks` 和取消追番记录，不同步 Token、缓存、设备设置或通知开关。
 

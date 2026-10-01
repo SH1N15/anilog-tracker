@@ -1,6 +1,6 @@
 [package]
 name = "anilog-tauri"
-version = "0.7.5"
+version = "0.7.6"
 description = "Local-first anime schedule, notification, and watch-task tracker"
 authors = ["SH1N15"]
 license = "MIT"
